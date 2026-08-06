@@ -133,7 +133,7 @@
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>3rdParty;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>3rdParty;3rdParty\imgui;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -143,6 +143,14 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="3rdParty\imgui\imgui.h" />
+    <ClInclude Include="3rdParty\imgui\imgui_internal.h" />
+    <ClInclude Include="3rdParty\imgui\imconfig.h" />
+    <ClInclude Include="3rdParty\imgui\imgui_impl_win32.h" />
+    <ClInclude Include="3rdParty\imgui\imgui_impl_opengl2.h" />
+    <ClInclude Include="3rdParty\imgui\imstb_rectpack.h" />
+    <ClInclude Include="3rdParty\imgui\imstb_textedit.h" />
+    <ClInclude Include="3rdParty\imgui\imstb_truetype.h" />
     <ClInclude Include="common\colormaps.h" />
     <ClInclude Include="common\colorramp.h" />
     <ClInclude Include="common\mlCommon.h" />
@@ -168,11 +176,19 @@
     <ClInclude Include="inc\2D\gpu\mrLbmSolverGpu2D.h" />
     <ClInclude Include="inc\2D\gpu\mrUtilFuncGpu2D.h" />
     <ClInclude Include="src\LbmCases2D.h" />
+    <ClInclude Include="src\ParamsIO.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="3rdParty\imgui\imgui.cpp" />
+    <ClCompile Include="3rdParty\imgui\imgui_draw.cpp" />
+    <ClCompile Include="3rdParty\imgui\imgui_tables.cpp" />
+    <ClCompile Include="3rdParty\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="3rdParty\imgui\imgui_impl_win32.cpp" />
+    <ClCompile Include="3rdParty\imgui\imgui_impl_opengl2.cpp" />
     <ClCompile Include="common\colorramp.cpp" />
     <ClCompile Include="common\mlCuRunTime.cpp" />
     <ClCompile Include="src\LbmCases2D.cpp" />
+    <ClCompile Include="src\ParamsIO.cpp" />
     <ClCompile Include="src\testMrLBM2D.cpp" />
   </ItemGroup>
   <ItemGroup>

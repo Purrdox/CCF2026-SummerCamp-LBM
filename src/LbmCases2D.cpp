@@ -1,4 +1,4 @@
-#include "LbmCases2D.h"
+﻿#include "LbmCases2D.h"
 #include "../inc/2D/cpu/mrConstantParamsCpu2D.h"
 
 #include <algorithm>
@@ -33,7 +33,7 @@ namespace
 			47.5f,
 			45.5f,
 			8.0f,
-			0.28f,
+			0.80f,//mark 请求 5：提高物体拖动/移动速度（原 0.28）
 			0.85f,
 			0
 		},
@@ -44,7 +44,7 @@ namespace
 			"Bottom slot jet into a quiescent channel",
 			96,//mark 96
 			192,//mark 192
-			0.00002f,//mark 粘度 0.020
+			0.020f,//mark 粘度 0.020
 			0.0f,
 			0.0f,
 			0.0f,
@@ -134,7 +134,7 @@ namespace
 	}
 }
 
-const DemoCaseDefinition& GetDemoCaseDefinition(DemoCaseId id)
+DemoCaseDefinition GetDefaultDefinition(DemoCaseId id)
 {
 	for (const DemoCaseDefinition& definition : kCases)
 	{
@@ -216,27 +216,78 @@ MLLATTICENODE_FLAG GetDemoCaseBaseFlag(
 	// ===== ASSIGNMENT FILL END: P2-P3-A =====
 }
 
-bool IsDemoCaseObstacleCell(
-	const DemoCaseDefinition& definition,
+bool IsObstacleCell(
+	ObstacleShape shape,
 	int x,
 	int y,
-	float obstacleX,
-	float obstacleY)
+	float cx,
+	float cy,
+	float radius)
 {
-	// ===== ASSIGNMENT FILL BEGIN: P2-A Karman cylinder geometry =====
-	// TODO: Identify lattice cells covered by the movable circular
-	// obstacle. Cases without an obstacle must never report a solid cell.
-	if (!definition.hasMovableObstacle)
+	const float dx = (float)x - cx;
+	const float dy = (float)y - cy;
+
+	if (shape == ObstacleShape::Circle)
 	{
-		return false;
+		const float dist2 = dx * dx + dy * dy;
+		const float r2 = radius * radius;
+		return dist2 <= r2;
 	}
 
-	const float dx = (float)x - obstacleX;
-	const float dy = (float)y - obstacleY;
-	const float dist2 = dx * dx + dy * dy;
-	const float r2 = definition.obstacleRadius * definition.obstacleRadius;
-	return dist2 <= r2;
-	// ===== ASSIGNMENT FILL END: P2-A =====
+	if (shape == ObstacleShape::Box)
+	{
+		// Box 为半宽 = 半高：以中心为中心的方形
+		return fabsf(dx) <= radius && fabsf(dy) <= radius;
+	}
+
+	// Diamond：对角线长度为 2 * radius 的旋转 45° 方形
+	return fabsf(dx) + fabsf(dy) <= radius;
+}
+
+bool IsAnyObstacleCell(
+	const RigidBody* bodies,
+	int bodyCount,
+	ObstacleShape shape,
+	int x,
+	int y)
+{
+	for (int i = 0; i < bodyCount; i++)
+	{
+		if (IsObstacleCell(shape, x, y, bodies[i].x, bodies[i].y, bodies[i].radius))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+int OwnerBodyOfCell(
+	const RigidBody* bodies,
+	int bodyCount,
+	ObstacleShape shape,
+	int x,
+	int y)
+{
+	// 从后往前遍历（后添加者优先），与 PickBody 一致
+	for (int i = bodyCount - 1; i >= 0; i--)
+	{
+		if (IsObstacleCell(shape, x, y, bodies[i].x, bodies[i].y, bodies[i].radius))
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+
+const char* GetObstacleShapeName(ObstacleShape shape)
+{
+	switch (shape)
+	{
+	case ObstacleShape::Circle: return "Circle";
+	case ObstacleShape::Box: return "Box";
+	case ObstacleShape::Diamond: return "Diamond";
+	}
+	return "Circle";
 }
 
 void WriteMoments2D(
@@ -292,12 +343,13 @@ void WriteEquilibriumMoments2D(
 void InitializeDemoCase(
 	mrFlow2D* flow,
 	const DemoCaseDefinition& definition,
-	float obstacleX,
-	float obstacleY)
+	const RigidBody* bodies,
+	int bodyCount,
+	ObstacleShape shape)
 {
 	// ===== ASSIGNMENT FILL BEGIN: P2-P3-B case initialization =====
 	// TODO: Initialize every lattice cell for the selected case.
-	// Combine the fixed boundary flag with the optional Karman cylinder,
+	// Combine the fixed boundary flag with the optional obstacle bodies,
 	// choose initial/inlet/no-slip velocity, and initialize both moment
 	// buffers with equilibrium moments at rho = 1.
 	for (int y = 0; y < definition.ny; y++)
@@ -306,8 +358,8 @@ void InitializeDemoCase(
 		{
 			const int idx = y * definition.nx + x;
 			MLLATTICENODE_FLAG flag = GetDemoCaseBaseFlag(definition, x, y);
-			if (definition.hasMovableObstacle &&
-				IsDemoCaseObstacleCell(definition, x, y, obstacleX, obstacleY))
+			const bool solid = IsAnyObstacleCell(bodies, bodyCount, shape, x, y);
+			if (solid)
 			{
 				flag = ML_SOLID;
 			}
@@ -361,20 +413,14 @@ void RefreshDemoCaseBoundaries(
 		WriteBoundaryMoments(flow, idx, neighborIdx, ux, uy);
 	}
 
-	// Top boundary (y = ny - 1): open outlet. Use a convective (Orlanski)
-	// outlet that extrapolates the velocity toward the boundary from the two
-	// interior rows, letting vorticity leave the domain without reflecting
-	// perturbations back (important at high Reynolds numbers).
+	// Top boundary (y = ny - 1): open outlet, copy interior velocity.
 	for (int x = 0; x < definition.nx; x++)
 	{
 		const int idx = (definition.ny - 1) * definition.nx + x;
 		const int neighborIdx = (definition.ny - 2) * definition.nx + x;
-		const int secondIdx = (definition.ny - 3) * definition.nx + x;
-		const REAL ux = flow->fMom[neighborIdx * 6 + 1] -
-			0.9f * (flow->fMom[neighborIdx * 6 + 1] - flow->fMom[secondIdx * 6 + 1]);
-		const REAL uy = flow->fMom[neighborIdx * 6 + 2] -
-			0.9f * (flow->fMom[neighborIdx * 6 + 2] - flow->fMom[secondIdx * 6 + 2]);
-		WriteBoundaryMoments(flow, idx, neighborIdx, ux, uy);
+		WriteBoundaryMoments(flow, idx, neighborIdx,
+			flow->fMom[neighborIdx * 6 + 1],
+			flow->fMom[neighborIdx * 6 + 2]);
 	}
 
 	// Left boundary (x = 0): wall for jet, outlet for Karman. Corners are

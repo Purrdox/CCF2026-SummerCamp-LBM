@@ -38,6 +38,7 @@ public:
 	cudaStream_t stream;
 	long count = 0;
 	REAL* vis_velocity;
+	REAL* smoke;   // §1.4 功能 4 预留：烟雾密度场（host 平流，设备端仅保持结构一致）
 
 	void Create
 	(
@@ -96,6 +97,7 @@ inline void mrFlow2D::Create(
 	flag = new MLLATTICENODE_FLAG[count];
 	forcex = new REAL[count];
 	forcey = new REAL[count];
+	smoke = new REAL[count];   // §1.4 功能 4 预留
 
 	for (long y = 0; y < sample_y_count; y++)
 	{
@@ -105,6 +107,7 @@ inline void mrFlow2D::Create(
 			flag[num] = ML_FLUID;
 			forcex[num] = 0;
 			forcey[num] = 0;
+			smoke[num] = 0;
 		}
 	}
 }

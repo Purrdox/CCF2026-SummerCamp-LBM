@@ -101,24 +101,9 @@ inline MLFUNC_TYPE void mrUtilFuncGpu2D::mlGetPIAfterCollision(REAL R, REAL U, R
 	const REAL piyy_eq = R * (V * V + cs2);
 	const REAL pixy_eq = R * U * V;
 
-	// MRT-style relaxation: relax the trace (energy mode) with omega_e and
-	// the trace-free part (shear modes) with omega. This keeps the physical
-	// shear viscosity unchanged (omega), while the energy mode is no longer
-	// amplified by the effective 2*omega factor that becomes unstable when
-	// omega approaches 2 (i.e. at very high Reynolds numbers).
-	const REAL omega_e = 1.0f;
-	const REAL T = pixx + piyy;
-	const REAL Teq = pixx_eq + piyy_eq;
-	const REAL Sxx = pixx - 0.5f * T;
-	const REAL Syy = piyy - 0.5f * T;
-	const REAL Sxy = pixy;
-	const REAL Sxx_eq = pixx_eq - 0.5f * Teq;
-	const REAL Syy_eq = piyy_eq - 0.5f * Teq;
-	const REAL Sxy_eq = pixy_eq;
-
-	pixx = Sxx + omega * (Sxx_eq - Sxx) + 0.5f * (T + omega_e * (Teq - T));
-	piyy = Syy + omega * (Syy_eq - Syy) + 0.5f * (T + omega_e * (Teq - T));
-	pixy = Sxy + omega * (Sxy_eq - Sxy);
+	pixx += omega * (pixx_eq - pixx);
+	piyy += omega * (piyy_eq -piyy);
+	pixy += omega * (pixy_eq - pixy);
 
 	const REAL forceFactor = 1.0f - 0.5f * omega;
 	pixx += forceFactor * 2.0f * U * Fx;

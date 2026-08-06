@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #ifndef MRSOLVER2DH_
 #define MRSOLVER2DH_
 
@@ -171,6 +171,14 @@ inline void mrSolver2D::mlDeepCopy(mrFlow2D* mllbm_host, mrFlow2D* mllbm_dev, in
 	checkCudaErrors(_MLCuMemcpy(&(mllbm_dev->forcey), &forcey_dev, sizeof(forcey_dev), cudaMemcpyHostToDevice));
 
 #pragma endregion
+
+	// §1.4 功能 4 预留：smoke 设备端指针置 NULL（方案 B）。
+	// 功能 4 的烟雾平流在 host 端执行，设备端不做分配；若不显式置 NULL，
+	// 上面的 sizeof(mrFlow2D) 整结构体拷贝会把 host 堆指针拷进设备结构体，
+	// 届时对 deviceCopy.smoke 做 cudaFree 会对 host 指针操作 → invalid device
+	// pointer 崩溃。kernel 不读 smoke，NULL 无害。
+	REAL* smoke_dev = NULL;
+	checkCudaErrors(_MLCuMemcpy(&(mllbm_dev->smoke), &smoke_dev, sizeof(smoke_dev), cudaMemcpyHostToDevice));
 }
 
 inline void mrSolver2D::mlVisVelocitySlice(long upw, long uph, int scaleNum, int frame)
