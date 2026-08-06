@@ -1,11 +1,11 @@
-﻿#pragma once
+#pragma once
 
 #include "LbmCases2D.h"
 
 // §4.3 参数文件读写（与 LbmApp 零耦合，只依赖 DemoCaseDefinition / RigidBody）。
 //
 // 文件格式：`key=value` 每行一项，`#` 开头为注释。
-// 覆盖字段：case / fieldView / stepsPerFrame / smokeEnabled / obstacleShape /
+// 覆盖字段：case / fieldView / stepsPerFrame / obstacleShape /
 //          bodyCount / bodyN{X,Y,Radius} / viscosity / initialUx / initialUy /
 //          inletUx / inletUy / inletPerturbationAmplitude /
 //          inletPerturbationPeriod / speedColorMax / vorticityColorMax / jetWidth
@@ -15,7 +15,6 @@ bool SaveAppParams(const char* path,
                    const DemoCaseDefinition& def,
                    DemoFieldView view,
                    int stepsPerFrame,
-                   bool smokeEnabled,
                    ObstacleShape shape,
                    int bodyCount,
                    const RigidBody* bodies /* kMaxBodies */);
@@ -36,7 +35,6 @@ bool LoadAppParams(const char* path,
                    DemoCaseDefinition& def,
                    DemoFieldView& view,
                    int& stepsPerFrame,
-                   bool& smokeEnabled,
                    ObstacleShape& shape,
                    int& bodyCount,
                    RigidBody* bodies /* kMaxBodies */,

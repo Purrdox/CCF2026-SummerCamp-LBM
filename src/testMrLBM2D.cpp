@@ -41,6 +41,9 @@ namespace
 	const float kMaximumWallSpeed = 0.25f;   // 请求 5：提高物体拖动/移动速度上限
 	const int kInverseDirection[9] = { 0, 3, 4, 1, 2, 7, 8, 5, 6 };
 
+	// 功能 4（colorful 视图）：力幅度上限
+	const float kFmax = 0.02f;            // §5.3 力幅度上限（与 blowStrength 滑块上限一致）
+
 	struct Moments2D
 	{
 		REAL rho;
@@ -512,6 +515,73 @@ namespace
 		}
 	}
 
+	// 功能 4：HSV → RGB（h∈[0,1)，s/v∈[0,1]）
+	void HsvToRgb(float h, float s, float v, float& r, float& g, float& b)
+	{
+		const int sector = (int)floorf(h * 6.0f) % 6;
+		const float f = h * 6.0f - floorf(h * 6.0f);
+		const float p = v * (1.0f - s);
+		const float q = v * (1.0f - s * f);
+		const float t = v * (1.0f - s * (1.0f - f));
+		switch (sector)
+		{
+		case 0: r = v; g = t; b = p; break;
+		case 1: r = q; g = v; b = p; break;
+		case 2: r = p; g = v; b = t; break;
+		case 3: r = p; g = q; b = v; break;
+		case 4: r = t; g = p; b = v; break;
+		default: r = v; g = p; b = q; break;
+		}
+	}
+
+	// 功能 4：rho/ux/uy → RGB 流场着色（§6.2 修正）。
+	// 平静（|u|≈0）→ 纯白；流速增大 → 按速度方向取色相 + 时间戳旋转，
+	// 生成鲜艳的动态色；rho 微调明度（压缩区更亮）。
+	// 数值范围参考：rho≈1.0（界 0.5~1.5），|u| 0~0.15（Karman 入口 0.10 /
+	// Jet 入口 0.08，speedColorMax 即归一化上限）。
+	// 关键修正（功能 4 第 2 点）：相对速度 = 实际速度 - 实时入口速度（refUx/refUy）。
+	// 参考速度取自当前 ML_INLET 格点的实际 ux/uy（含扰动，随帧更新，非固定配置值）；
+	// 当全场稳定同向流动时各格点速度≈入口速度 → 相对速度≈0 → 全白。
+	// colorfulSaturation 控制颜色鲜艳度（0=全白，越高越鲜艳）。
+	void MapFlowFieldColor(
+		REAL rho,
+		REAL ux,
+		REAL uy,
+		float refUx,
+		float refUy,
+		float speedColorMax,
+		float colorfulSaturation,
+		float timeSeconds,
+		float& r,
+		float& g,
+		float& b)
+	{
+		const float effUx = (float)ux - refUx;
+		const float effUy = (float)uy - refUy;
+		const float speed = sqrtf(effUx * effUx + effUy * effUy);
+		const float strength = ClampFloat(
+			speed / std::max(speedColorMax, 1.0e-4f), 0.0f, 1.0f);
+		// smoothstep：低速仍保持白底，向鲜艳色平滑过渡；再乘鲜艳度（0→全白）
+		float blend = strength * strength * (3.0f - 2.0f * strength);
+		blend *= ClampFloat(colorfulSaturation, 0.0f, 1.0f);
+
+		const float kPi = 3.14159265f;
+		// 方向色相 + 时间旋转（约 60s 一圈，变化缓慢，仅作轻微动感）
+		float hue = atan2f(effUy, effUx) / (2.0f * kPi) + 0.5f
+			+ 0.0167f * timeSeconds;
+		hue -= floorf(hue);
+		// rho 微调明度：rho=1.0 → 1.0，波动 ±0.02 → 明度 ±0.2
+		const float value = ClampFloat(
+			1.0f + ((float)rho - 1.0f) * 10.0f, 0.6f, 1.0f);
+
+		float vr = 1.0f, vg = 1.0f, vb = 1.0f;
+		HsvToRgb(hue, 1.0f, value, vr, vg, vb);
+		// 与白色按 blend 混合：平静纯白，快速鲜艳
+		r = 1.0f * (1.0f - blend) + vr * blend;
+		g = 1.0f * (1.0f - blend) + vg * blend;
+		b = 1.0f * (1.0f - blend) + vb * blend;
+	}
+
 	void BuildFieldImage(
 		const mrFlow2D* flow,
 		const DemoCaseDefinition& definition,
@@ -534,6 +604,10 @@ namespace
 					const REAL uy = flow->fMom[index * 6 + 2];
 					values[index] = sqrtf(ux * ux + uy * uy);
 					continue;
+				}
+				if (view == DemoFieldView::Colorful)
+				{
+					continue;   // colorful 视图：不需要标量场，直接按 rho/ux/uy 上色
 				}
 
 				const int left = y * nx + std::max(0, x - 1);
@@ -559,6 +633,34 @@ namespace
 		}
 
 		ColorRamp colorRamp;
+		// 功能 4：时间戳（ms）→ 秒，供 Colorful 视图色相旋转（GetTickCount 掩码防浮点精度损失）
+		const float timeSeconds = (float)(GetTickCount() & 0x3FFFFFFF) * 0.001f;
+		// 功能 4 第 2 点：colorful 视图实时参考速度 = 当前入口（ML_INLET）格点实际速度的均值。
+		// 全场稳定同向流动时格点速度≈入口速度 → 相对速度≈0 → 全白。
+		// 无入口格点（理论上不会发生）时回退到配置的 inletUx/inletUy。
+		float refUx = (float)definition.inletUx;
+		float refUy = (float)definition.inletUy;
+		if (view == DemoFieldView::Colorful)
+		{
+			double sumUx = 0.0;
+			double sumUy = 0.0;
+			int inletCount = 0;
+			for (int i = 0; i < nx * ny; i++)
+			{
+				if (flow->flag[i] == ML_INLET)
+				{
+					sumUx += flow->fMom[i * 6 + 1];
+					sumUy += flow->fMom[i * 6 + 2];
+					inletCount++;
+				}
+			}
+			if (inletCount > 0)
+			{
+				refUx = (float)(sumUx / inletCount);
+				refUy = (float)(sumUy / inletCount);
+			}
+		}
+
 		for (int y = 0; y < ny; y++)
 		{
 			for (int x = 0; x < nx; x++)
@@ -583,6 +685,20 @@ namespace
 					r = 0.16f;
 					g = 0.18f;
 					b = 0.20f;
+				}
+				else if (view == DemoFieldView::Colorful)
+				{
+					// 功能 4：rho/ux/uy → RGB 流场着色（平静=白，快速=鲜艳+时间旋转）
+					MapFlowFieldColor(
+						flow->fMom[index * 6 + 0],
+						flow->fMom[index * 6 + 1],
+						flow->fMom[index * 6 + 2],
+						refUx,
+						refUy,
+						definition.speedColorMax,
+						definition.colorfulSaturation,
+						timeSeconds,
+						r, g, b);
 				}
 				else if (view == DemoFieldView::VelocityMagnitude)
 				{
@@ -630,6 +746,12 @@ namespace
 		}
 	}
 
+	// 功能 4：LbmApp 内联成员函数（ApplyMouseEffects 等）调用的自由函数前置声明，
+	// 定义在本文件下方（§5.4 面板豁免 / layout 现算）
+	UiLayout CurrentLayout(HWND window);
+	bool IsOverUiPanel(int mx, int my, const UiLayout& layout);
+	bool UiWantsCaptureMouse();
+
 	struct LbmApp
 	{
 		mrSolver2D solver;
@@ -666,14 +788,19 @@ namespace
 		float grabOffsetX = 0.0f;
 		float grabOffsetY = 0.0f;
 
-		// 功能 4 预留（烟雾交互，§1.4）
-		bool smokeEnabled = false;
-		enum class InteractionTool { None, PaintSmoke, EraseSmoke, Blow, Vortex };
+		// 功能 4（colorful 交互）
+		enum class InteractionTool { None, Blow, Vortex };
 		InteractionTool activeTool = InteractionTool::None;
-		float smokeBrushRadius = 6.0f;
-		float smokeRate = 0.02f;
+		float brushRadius = 6.0f;
 		float blowStrength = 0.004f;
-		std::vector<int> solidCellsCache;
+
+		// 功能 4（colorful，§2 新增成员）
+		HWND appWindow = NULL;               // 窗口句柄：hover 豁免需现算 layout（§5.4）
+		int prevMouseScreenX = 0;            // 帧间鼠标差分 → Blow 方向（§5.5）
+		int prevMouseScreenY = 0;
+		std::vector<int> injectedForceCells; // 本帧注入力的格点集合（§5.2/§5.3）
+		float blowDirX = 0.0f;               // 本帧吹风方向（屏幕差分 → 格点方向，§5.5）
+		float blowDirY = 1.0f;
 
 		// 功能 5 预留（Ctrl 调试 + 放大，§1.4）
 		bool ctrlHeld = false;
@@ -700,7 +827,6 @@ namespace
 				delete[] flow->param;
 				delete[] flow->forcex;
 				delete[] flow->forcey;
-				delete[] flow->smoke;   // §1.4 功能 4 预留：host 端 smoke 与 fMom 同批释放
 				delete flow;
 			}
 
@@ -751,13 +877,14 @@ namespace
 			}
 
 			// 预留状态复位（功能 4/5）
-			solidCellsCache.clear();
 			dragging = false;
 			lButtonDown = rButtonDown = mButtonDown = false;
-			smokeEnabled = false;
 			activeTool = InteractionTool::None;
 			ctrlHeld = false;
 			debugCellX = debugCellY = -1;
+			// 功能 4：与网格同生命周期复位（§2）
+			injectedForceCells.clear();
+			prevMouseScreenX = prevMouseScreenY = 0;
 
 			flow = new mrFlow2D();
 			flow->Create(
@@ -1014,18 +1141,6 @@ namespace
 
 			// ===== ASSIGNMENT FILL END: P2-B =====
 
-			// 功能 4 预留：固体格点缓存（仅物体格点）
-			solidCellsCache.clear();
-			for (int idx = 0; idx < count; idx++)
-			{
-				if (newFlags[idx] == ML_SOLID &&
-					OwnerBodyOfCell(bodies.data(), bodyCount, obstacleShape,
-						idx % nx, idx / nx) >= 0)
-				{
-					solidCellsCache.push_back(idx);
-				}
-			}
-
 			SyncCellsToDevice(solver, 0, touchedCells, flagsChanged);
 		}
 
@@ -1227,10 +1342,137 @@ namespace
 			}
 		}
 
-		// 功能 4 预留挂点（§1.4）：本期为空实现，仅注释标记。
+		// §5.2 工具统一入口：cx/cy = 格点坐标（mouseFieldX/Y），pressed = 是否按下。
+		// 仅 Blow/Vortex 写 forcex/forcey 并收集到 injectedForceCells 供
+		// ClearInjectedForces 本帧末清零。
+		// 注意：不在开头 clear injectedForceCells——同一帧内左键工具 + 中键旋涡
+		// 可能同时执行，第二个工具若 clear 会丢失第一个的格点 → 漏清力（§10.11）。
+		void ApplyToolAt(float cx, float cy, InteractionTool tool, bool pressed)
+		{
+			const int nx = definition.nx;
+			const int ny = definition.ny;
+			const int radius = (int)std::ceil(brushRadius);
+			const float radius2 = brushRadius * brushRadius;
+
+			for (int y = (int)cy - radius; y <= (int)cy + radius; y++)
+			{
+				for (int x = (int)cx - radius; x <= (int)cx + radius; x++)
+				{
+					if (x < 1 || y < 1 || x >= nx - 1 || y >= ny - 1) continue;
+					const int idx = y * nx + x;
+					const float dx = (float)x - cx;
+					const float dy = (float)y - cy;
+					if (dx * dx + dy * dy > radius2) continue;
+					// 边界格点（INLET/OUTLET/WALL_*）禁止施力（沿用"边界禁画"原则）
+					if (flow->flag[idx] != ML_FLUID) continue;
+
+					switch (tool)
+					{
+					case InteractionTool::Blow:
+					{
+						// §5.5 定向体力：方向 = 帧间鼠标差分（blowDirX/Y），强度 blowStrength
+						const float dist = sqrtf(dx * dx + dy * dy);
+						const float falloff = std::max(0.0f,
+							1.0f - dist / brushRadius);
+						flow->forcex[idx] = ClampFloat(
+							blowDirX * blowStrength * falloff, -kFmax, kFmax);
+						flow->forcey[idx] = ClampFloat(
+							blowDirY * blowStrength * falloff, -kFmax, kFmax);
+						injectedForceCells.push_back(idx);
+						break;
+					}
+					case InteractionTool::Vortex:
+					{
+						// §5.5 切向体力场（逆时针）；k 与 blowStrength 同量级
+						const float dist = std::max(1.0e-4f, sqrtf(dx * dx + dy * dy));
+						const float falloff = std::max(0.0f,
+							1.0f - dist / brushRadius);
+						flow->forcex[idx] = ClampFloat(
+							-blowStrength * (dy / dist) * falloff, -kFmax, kFmax);
+						flow->forcey[idx] = ClampFloat(
+							blowStrength * (dx / dist) * falloff, -kFmax, kFmax);
+						injectedForceCells.push_back(idx);
+						break;
+					}
+					case InteractionTool::None:
+					default:
+						break;
+					}
+				}
+			}
+
+			if (!injectedForceCells.empty())
+			{
+				SyncCellsToDevice(solver, 0, injectedForceCells, /*syncFlags=*/false);
+			}
+		}
+
+		// §5.3 清力：与 WriteMoments2D（只清边界/固体格点）互补——本函数只清
+		// brush 写入的流体格点，保证注入的力"只活一帧"。
+		void ClearInjectedForces()
+		{
+			if (injectedForceCells.empty())
+			{
+				return;
+			}
+			for (const int idx : injectedForceCells)
+			{
+				flow->forcex[idx] = 0.0f;
+				flow->forcey[idx] = 0.0f;
+			}
+			SyncCellsToDevice(solver, 0, injectedForceCells, /*syncFlags=*/false);
+			injectedForceCells.clear();
+		}
+
+		// 功能 4（§5.1/§5.4/§5.5）：交互状态机。每 UI 帧由 Step() 调用一次，
+		// 位于 LBM 循环之前：本帧注入的力本帧就被流场响应（视觉跟手）。
 		void ApplyMouseEffects()
 		{
-			// TODO(M5): 烟雾注入（activeTool / smokeBrushRadius / smokeRate / blowStrength）
+			if (flow == NULL)
+			{
+				return;
+			}
+
+			// §5.5 差分更新：无条件执行，保证差分是"帧间增量"而非"按下以来总位移"
+			const int dScreenX = mouseScreenX - prevMouseScreenX;
+			const int dScreenY = mouseScreenY - prevMouseScreenY;
+			prevMouseScreenX = mouseScreenX;
+			prevMouseScreenY = mouseScreenY;
+			// 屏幕 y 向下、格点 y 向上：对屏幕 dy 取反后才是格点方向（视觉一致）
+			blowDirX = 0.0f;
+			blowDirY = 1.0f;   // 未动 → 主流方向（Karman/Jet 均 +y 上行）
+			if (dScreenX != 0 || dScreenY != 0)
+			{
+				const float len = sqrtf(
+					(float)(dScreenX * dScreenX + dScreenY * dScreenY));
+				blowDirX = (float)dScreenX / len;
+				blowDirY = -(float)dScreenY / len;
+			}
+
+			// §5.4 面板豁免（双保险）：所有工具执行前必须现算 layout
+			const UiLayout layout = CurrentLayout(appWindow);
+			const bool overPanel =
+				IsOverUiPanel(mouseScreenX, mouseScreenY, layout);
+			const bool uiCaptures = UiWantsCaptureMouse();
+
+			// 左键：Shift+左键 = Blow（覆盖 activeTool）；未命中物体时按 activeTool
+			if (lButtonDown && !dragging && !overPanel && !uiCaptures)
+			{
+				const bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+				InteractionTool tool =
+					shiftHeld ? InteractionTool::Blow : activeTool;
+				if (tool != InteractionTool::None)
+				{
+					ApplyToolAt(mouseFieldX, mouseFieldY, tool, true);
+				}
+			}
+
+			// 中键：旋涡（不依赖工具选择，恒可用）
+			if (mButtonDown && !overPanel && !uiCaptures)
+			{
+				ApplyToolAt(
+					mouseFieldX, mouseFieldY, InteractionTool::Vortex, true);
+			}
 		}
 
 		void Step()
@@ -1240,7 +1482,7 @@ namespace
 				return;
 			}
 
-			// 功能 4/6 挂点：LBM 循环之前的鼠标效果（本期为空实现）
+			// 功能 4/6 挂点：LBM 循环之前的鼠标效果（注入烟 + 写力）
 			ApplyMouseEffects();
 
 			RefreshDemoCaseBoundaries(
@@ -1254,6 +1496,7 @@ namespace
 			}
 
 			CopyMomentsFromDevice(solver, 0);
+			ClearInjectedForces();   // ③ 清本帧注入的力 + 同步（§5.3，力"只活一帧"）
 			ComputeSolidLoads();
 			BuildFieldImage(flow, definition, fieldView, pixels);
 			frame++;
@@ -1261,9 +1504,12 @@ namespace
 
 		void ToggleFieldView()
 		{
+			// 功能 4：三视图循环 Velocity → Vorticity → Colorful → Velocity（V 键）
 			fieldView = fieldView == DemoFieldView::VelocityMagnitude
 				? DemoFieldView::Vorticity
-				: DemoFieldView::VelocityMagnitude;
+				: (fieldView == DemoFieldView::Vorticity
+					? DemoFieldView::Colorful
+					: DemoFieldView::VelocityMagnitude);
 			if (initialized)
 			{
 				BuildFieldImage(flow, definition, fieldView, pixels);
@@ -1426,7 +1672,6 @@ namespace
 		DemoCaseDefinition def;
 		DemoFieldView view = DemoFieldView::Vorticity;
 		int stepsPerFrame = 5;
-		bool smokeEnabled = false;
 		ObstacleShape shape = ObstacleShape::Circle;
 		int bodyCount = 0;
 		std::array<RigidBody, kMaxBodies> bodies = {};
@@ -1436,7 +1681,7 @@ namespace
 	// §4.3 优先级约定：命令行显式 --case 时 ini 不覆盖 case（只覆盖其余参数）
 	bool gCaseSpecifiedOnCommandLine = false;
 
-	// §4.2 当前预设索引（Karman / Karman+Smoke / Jet / Jet+Smoke / Custom）
+	// §4.2 当前预设索引（Karman / Jet / Custom）
 	int gActivePreset = 0;
 
 	// 请求 1：UI / 窗口大小模式（小=当前默认窗口 1040×820，中=中等窗口，
@@ -1559,6 +1804,23 @@ namespace
 				r = color.x;
 				g = color.y;
 				b = color.z;
+			}
+			else if (gApp.fieldView == DemoFieldView::Colorful)
+			{
+				// 功能 4 第 3 点：色条显示"时间对应的默认颜色"——随时间缓慢旋转的色相。
+				// 旋转速率与 MapFlowFieldColor 一致（0.0167 rad/s，约 60s 一圈），
+				// 色相基址同样含 +0.5 偏移；白色端 = 相对速度 0（静止/稳定同向），
+				// 右端 = 当前时刻的全鲜艳色。Render 每帧重建以跟随时间。
+				const float timeSeconds =
+					(float)(GetTickCount() & 0x3FFFFFFF) * 0.001f;
+				const float t = (float)i / 255.0f;
+				float hue = 0.5f + 0.0167f * timeSeconds;
+				hue -= floorf(hue);
+				float vr = 1.0f, vg = 1.0f, vb = 1.0f;
+				HsvToRgb(hue, 1.0f, 1.0f, vr, vg, vb);
+				r = 1.0f * (1.0f - t) + vr * t;
+				g = 1.0f * (1.0f - t) + vg * t;
+				b = 1.0f * (1.0f - t) + vb * t;
 			}
 			else
 			{
@@ -2015,18 +2277,18 @@ namespace
 				RestartWithCurrentSettings(window);
 			}
 
-			const char* viewItems[] = { "Velocity", "Vorticity" };
-			int viewIndex =
-				gApp.fieldView == DemoFieldView::VelocityMagnitude ? 0 : 1;
-			if (ImGui::Combo("Field view", &viewIndex, viewItems, 2))
+			const char* viewItems[] = { "Velocity", "Vorticity", "Colorful" };
+			int viewIndex = (int)gApp.fieldView;
+			if (ImGui::Combo("Field view", &viewIndex, viewItems, 3))
 			{
-				const DemoFieldView newView =
-					viewIndex == 0
-					? DemoFieldView::VelocityMagnitude
-					: DemoFieldView::Vorticity;
-				if (newView != gApp.fieldView)
+				if (viewIndex != (int)gApp.fieldView)
 				{
-					gApp.ToggleFieldView();
+					gApp.fieldView = (DemoFieldView)viewIndex;
+					if (gApp.initialized)
+					{
+						BuildFieldImage(
+							gApp.flow, gApp.definition, gApp.fieldView, gApp.pixels);
+					}
 					RebuildLegendTexture();   // §5.5 色条内容随视图切换
 				}
 			}
@@ -2044,16 +2306,16 @@ namespace
 					caseIndex == 0
 					? DemoCaseId::KarmanVortex
 					: DemoCaseId::JetFlow);
-				gActivePreset = 4;   // 已偏离内置预设 → 标记 Custom
+				gActivePreset = 2;   // 已偏离内置预设 → 标记 Custom
 			}
 
 			// §4.2 预设下拉（选择即应用，等效 §5.3 的 [Apply]）
 			const char* presetItems[] =
 			{
-				"Karman", "Karman+Smoke", "Jet", "Jet+Smoke", "Custom"
+				"Karman", "Jet", "Custom"
 			};
 			int presetIndex = gActivePreset;
-			if (ImGui::Combo("Preset", &presetIndex, presetItems, 5))
+			if (ImGui::Combo("Preset", &presetIndex, presetItems, 3))
 			{
 				if (presetIndex != gActivePreset)
 				{
@@ -2066,9 +2328,9 @@ namespace
 			if (ImGui::Button("Restore defaults"))
 			{
 				ResetSimulation(window, gApp.caseId);
-				// 恢复默认 = 回到该 case 的基础预设（Karman=0 / Jet=2）
+				// 恢复默认 = 回到该 case 的基础预设（Karman=0 / Jet=1）
 				gActivePreset =
-					gApp.caseId == DemoCaseId::KarmanVortex ? 0 : 2;
+					gApp.caseId == DemoCaseId::KarmanVortex ? 0 : 1;
 			}
 			ImGui::SameLine();
 			// §4.3 保存/读取参数文件（ParamsIO，M4c）
@@ -2079,7 +2341,6 @@ namespace
 					gApp.definition,
 					gApp.fieldView,
 					gApp.stepsPerFrame,
-					gApp.smokeEnabled,
 					gApp.obstacleShape,
 					gApp.bodyCount,
 					gApp.bodies.data()))
@@ -2099,7 +2360,6 @@ namespace
 					loaded.def,
 					loaded.view,
 					loaded.stepsPerFrame,
-					loaded.smokeEnabled,
 					loaded.shape,
 					loaded.bodyCount,
 					loaded.bodies.data(),
@@ -2110,20 +2370,18 @@ namespace
 					ApplyLoadedStartupParams(window);
 					UpdateWindowTitle(window);
 					// 与默认 def 一致时归位对应基础预设，否则视为 Custom
-					gActivePreset = 4;
+					gActivePreset = 2;
 					if (loaded.caseId == DemoCaseId::KarmanVortex &&
-						loaded.smokeEnabled == false &&
 						loaded.def.viscosity ==
 							GetDefaultDefinition(DemoCaseId::KarmanVortex).viscosity)
 					{
 						gActivePreset = 0;
 					}
 					else if (loaded.caseId == DemoCaseId::JetFlow &&
-						loaded.smokeEnabled == false &&
 						loaded.def.viscosity ==
 							GetDefaultDefinition(DemoCaseId::JetFlow).viscosity)
 					{
-						gActivePreset = 2;
+						gActivePreset = 1;
 					}
 				}
 				else
@@ -2186,7 +2444,8 @@ namespace
 				gApp.definition.inletPerturbationPeriod = perturbationPeriod;
 			}
 			// 请求 3：颜色上限只在对应显示模式下展示
-			//（Velocity 视图只显示 Speed color max，Vorticity 视图只显示 Vorticity color max）
+			//（Velocity 视图只显示 Speed color max，Vorticity 视图只显示 Vorticity color max；
+			//  Colorful 视图显示颜色鲜艳度滑块——越低越白、越高越鲜艳）
 			if (gApp.fieldView == DemoFieldView::VelocityMagnitude)
 			{
 				float speedMax = gApp.definition.speedColorMax;
@@ -2196,13 +2455,23 @@ namespace
 					gApp.definition.speedColorMax = speedMax;
 				}
 			}
-			else
+			else if (gApp.fieldView == DemoFieldView::Vorticity)
 			{
 				float vorticityMax = gApp.definition.vorticityColorMax;
 				if (ImGui::SliderFloat(
 					"Vorticity color max", &vorticityMax, 0.01f, 0.5f, "%.3f"))
 				{
 					gApp.definition.vorticityColorMax = vorticityMax;
+				}
+			}
+			else if (gApp.fieldView == DemoFieldView::Colorful)
+			{
+				// 功能 4 第 4 点：颜色鲜艳度（0=全白，1=全鲜艳，与时间/方向无关）
+				float saturation = gApp.definition.colorfulSaturation;
+				if (ImGui::SliderFloat(
+					"Color saturation", &saturation, 0.0f, 1.0f, "%.2f"))
+				{
+					gApp.definition.colorfulSaturation = saturation;
 				}
 			}
 			// jetWidth：入口几何由 flag 固化，必须重建（§4.1 第三类）。
@@ -2342,18 +2611,35 @@ namespace
 			ImGui::EndDisabled();
 		}
 
-		// ---- TOOLS（功能 4 预留，§5.3）----
-		if (ImGui::CollapsingHeader("TOOLS (smoke, reserved)"))
+		// ---- TOOL（功能 4，通用工具栏：吹风 / 旋涡；点按确认式，仅两个选项直接展开）----
+		if (ImGui::CollapsingHeader("Tool", ImGuiTreeNodeFlags_DefaultOpen))
 		{
-			ImGui::Checkbox("Smoke enabled", &gApp.smokeEnabled);
-			const char* toolItems[] = { "None", "Paint", "Erase", "Blow", "Vortex" };
-			int toolIndex = (int)gApp.activeTool;
-			if (ImGui::Combo("Tool", &toolIndex, toolItems, 5))
+			// 点按确认式工具按钮：点击选中，再次点击已选中的工具 → 取消（回到 None）。
+			// 交互逻辑不变：选中后左键即用该工具；未选中时仍可用快捷键
+			//（Shift+左键=吹风、中键=旋涡，见 ApplyMouseEffects）。
+			const float toolWidth = 90.0f;
+			if (ImGui::Selectable(
+				"Blow",
+				gApp.activeTool == LbmApp::InteractionTool::Blow,
+				0,
+				ImVec2(toolWidth, 0.0f)))
 			{
-				gApp.activeTool = (LbmApp::InteractionTool)toolIndex;
+				gApp.activeTool = (gApp.activeTool == LbmApp::InteractionTool::Blow)
+					? LbmApp::InteractionTool::None
+					: LbmApp::InteractionTool::Blow;
 			}
-			ImGui::SliderFloat("Brush radius", &gApp.smokeBrushRadius, 1.0f, 20.0f);
-			ImGui::SliderFloat("Smoke rate", &gApp.smokeRate, 0.001f, 0.1f, "%.3f");
+			ImGui::SameLine();
+			if (ImGui::Selectable(
+				"Vortex",
+				gApp.activeTool == LbmApp::InteractionTool::Vortex,
+				0,
+				ImVec2(toolWidth, 0.0f)))
+			{
+				gApp.activeTool = (gApp.activeTool == LbmApp::InteractionTool::Vortex)
+					? LbmApp::InteractionTool::None
+					: LbmApp::InteractionTool::Vortex;
+			}
+			ImGui::SliderFloat("Brush radius", &gApp.brushRadius, 1.0f, 20.0f);
 			ImGui::SliderFloat("Blow strength", &gApp.blowStrength, 0.0f, 0.02f, "%.4f");
 		}
 
@@ -2412,6 +2698,11 @@ namespace
 		DrawField(layout.field);
 		DrawBodies(layout.field);
 		DrawDebugOverlay(layout);
+		// 功能 4 第 3 点：colorful 色条随时间旋转，需每帧重建（256×1 纹理，开销可忽略）
+		if (gApp.fieldView == DemoFieldView::Colorful)
+		{
+			RebuildLegendTexture();
+		}
 		DrawLegendOverlay(layout.field);   // 请求 4：色条固定在画面右下角
 
 		// §5.2 新渲染顺序：ImGui 帧在场景绘制之后
@@ -2478,11 +2769,11 @@ namespace
 			loaded.inletPerturbationPeriod;
 		gApp.definition.speedColorMax = loaded.speedColorMax;
 		gApp.definition.vorticityColorMax = loaded.vorticityColorMax;
+		gApp.definition.colorfulSaturation = loaded.colorfulSaturation;
 		gApp.definition.jetWidth = loaded.jetWidth;
 
 		gApp.fieldView = gLoadedParams.view;
 		gApp.stepsPerFrame = gLoadedParams.stepsPerFrame;
-		gApp.smokeEnabled = gLoadedParams.smokeEnabled;
 		gApp.obstacleShape = gLoadedParams.shape;
 
 		// 物体系统：§1.2 约定 hasMovableObstacle == false（Jet）时 bodyCount == 0
@@ -2607,7 +2898,6 @@ namespace
 		saved.def = gApp.definition;
 		saved.view = gApp.fieldView;
 		saved.stepsPerFrame = gApp.stepsPerFrame;
-		saved.smokeEnabled = gApp.smokeEnabled;
 		saved.shape = gApp.obstacleShape;
 		saved.bodyCount = gApp.bodyCount;
 		saved.bodies = gApp.bodies;
@@ -2617,22 +2907,19 @@ namespace
 		UpdateWindowTitle(window);
 	}
 
-	// §4.2 预设系统：内置 Karman / Karman+Smoke / Jet / Jet+Smoke + 运行时 Custom。
-	// 切换预设 → def 拷贝 + smokeEnabled 拷贝 → 复用 ApplyLoadedStartupParams 三分类分发。
+	// §4.2 预设系统：内置 Karman / Jet + 运行时 Custom（功能 4：smoke 预设已移除）。
+	// 切换预设 → def 拷贝 → 复用 ApplyLoadedStartupParams 分发。
 	void ApplyPreset(HWND window, int presetIndex)
 	{
 		static const struct
 		{
 			const char* name;
 			DemoCaseId id;
-			bool smokeEnabled;
 		} kPresets[] =
 		{
-			{ "Karman", DemoCaseId::KarmanVortex, false },
-			{ "Karman+Smoke", DemoCaseId::KarmanVortex, true },
-			{ "Jet", DemoCaseId::JetFlow, false },
-			{ "Jet+Smoke", DemoCaseId::JetFlow, true },
-			{ "Custom", DemoCaseId::KarmanVortex, false }   // 运行时 custom：当前状态
+			{ "Karman", DemoCaseId::KarmanVortex },
+			{ "Jet", DemoCaseId::JetFlow },
+			{ "Custom", DemoCaseId::KarmanVortex }   // 运行时 custom：当前状态
 		};
 		if (presetIndex < 0 || presetIndex >= (int)(sizeof(kPresets) / sizeof(kPresets[0])))
 		{
@@ -2640,7 +2927,7 @@ namespace
 		}
 
 		gActivePreset = presetIndex;
-		if (presetIndex == 4)
+		if (presetIndex == 2)
 		{
 			return;   // Custom：不做任何修改，仅标记
 		}
@@ -2651,7 +2938,6 @@ namespace
 		gLoadedParams.def = def;
 		gLoadedParams.view = def.defaultView;
 		gLoadedParams.stepsPerFrame = def.initialStepsPerFrame;
-		gLoadedParams.smokeEnabled = kPresets[presetIndex].smokeEnabled;
 		gLoadedParams.shape = ObstacleShape::Circle;
 		gLoadedParams.bodyCount = def.hasMovableObstacle ? 1 : 0;
 		gLoadedParams.bodies = {};
@@ -3001,7 +3287,6 @@ int main(int argc, char** argv)
 		gLoadedParams.def,
 		gLoadedParams.view,
 		gLoadedParams.stepsPerFrame,
-		gLoadedParams.smokeEnabled,
 		gLoadedParams.shape,
 		gLoadedParams.bodyCount,
 		gLoadedParams.bodies.data(),
@@ -3058,6 +3343,8 @@ int main(int argc, char** argv)
 			MB_ICONERROR);
 		return 1;
 	}
+	// 功能 4：窗口句柄交给 gApp（hover 豁免现算 layout 需要，§5.4/§10.12）
+	gApp.appWindow = window;
 
 	MSG message;
 	while (GetMessageW(&message, NULL, 0, 0) > 0)

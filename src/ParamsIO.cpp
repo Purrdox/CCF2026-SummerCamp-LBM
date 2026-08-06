@@ -1,4 +1,4 @@
-﻿#include "ParamsIO.h"
+#include "ParamsIO.h"
 
 #include <algorithm>
 #include <cctype>
@@ -183,7 +183,6 @@ bool SaveAppParams(
 	const DemoCaseDefinition& def,
 	DemoFieldView view,
 	int stepsPerFrame,
-	bool smokeEnabled,
 	ObstacleShape shape,
 	int bodyCount,
 	const RigidBody* bodies)
@@ -196,9 +195,8 @@ bool SaveAppParams(
 
 	out << "# Home2D LBM params (key=value per line, '#' = comment)\n";
 	out << "case=" << (def.cliName != nullptr ? def.cliName : "karman") << "\n";
-	out << "fieldView=" << (view == DemoFieldView::VelocityMagnitude ? 0 : 1) << "\n";
+	out << "fieldView=" << (int)view << "\n";   // 0=Velocity 1=Vorticity 2=Colorful
 	out << "stepsPerFrame=" << stepsPerFrame << "\n";
-	out << "smokeEnabled=" << (smokeEnabled ? 1 : 0) << "\n";
 	out << "obstacleShape=" << (int)shape << "\n";
 	out << "bodyCount=" << bodyCount << "\n";
 	bodyCount = std::max(0, std::min(bodyCount, kMaxBodies));
@@ -217,6 +215,7 @@ bool SaveAppParams(
 	out << "inletPerturbationPeriod=" << def.inletPerturbationPeriod << "\n";
 	out << "speedColorMax=" << def.speedColorMax << "\n";
 	out << "vorticityColorMax=" << def.vorticityColorMax << "\n";
+	out << "colorfulSaturation=" << def.colorfulSaturation << "\n";
 	out << "jetWidth=" << def.jetWidth << "\n";
 	out.close();
 	return true;
@@ -228,7 +227,6 @@ bool LoadAppParams(
 	DemoCaseDefinition& def,
 	DemoFieldView& view,
 	int& stepsPerFrame,
-	bool& smokeEnabled,
 	ObstacleShape& shape,
 	int& bodyCount,
 	RigidBody* bodies,
@@ -279,7 +277,6 @@ bool LoadAppParams(
 	def = GetDefaultDefinition(caseId);
 	view = def.defaultView;
 	stepsPerFrame = def.initialStepsPerFrame;
-	smokeEnabled = false;
 	shape = ObstacleShape::Circle;
 	bodyCount = 0;
 	for (int i = 0; i < kMaxBodies; i++)
@@ -304,9 +301,12 @@ bool LoadAppParams(
 			int parsed = 0;
 			if (ParseIntValue(value, parsed))
 			{
-				view = (parsed == 0)
-					? DemoFieldView::VelocityMagnitude
-					: DemoFieldView::Vorticity;
+				switch (parsed)
+				{
+				case 1: view = DemoFieldView::Vorticity; break;
+				case 2: view = DemoFieldView::Colorful; break;
+				default: view = DemoFieldView::VelocityMagnitude; break;
+				}
 			}
 		}
 		else if (key == "stepsPerFrame")
@@ -315,14 +315,6 @@ bool LoadAppParams(
 			if (ParseIntValue(value, parsed) && parsed >= 1 && parsed <= 50)
 			{
 				stepsPerFrame = parsed;
-			}
-		}
-		else if (key == "smokeEnabled")
-		{
-			int parsed = 0;
-			if (ParseIntValue(value, parsed))
-			{
-				smokeEnabled = (parsed != 0);
 			}
 		}
 		else if (key == "obstacleShape")
@@ -413,6 +405,14 @@ bool LoadAppParams(
 			if (ParseFloatValue(value, parsed))
 			{
 				def.vorticityColorMax = ClampFloat(parsed, 0.01f, 0.5f);
+			}
+		}
+		else if (key == "colorfulSaturation")
+		{
+			float parsed = 0.0f;
+			if (ParseFloatValue(value, parsed))
+			{
+				def.colorfulSaturation = ClampFloat(parsed, 0.0f, 2.0f);
 			}
 		}
 		else if (key == "jetWidth")

@@ -33,7 +33,8 @@ enum class DemoCaseId
 enum class DemoFieldView
 {
 	VelocityMagnitude,
-	Vorticity
+	Vorticity,
+	Colorful   // 功能 4：rho/ux/uy 流场着色（平静=白，快速=鲜艳+时间旋转）
 };
 
 struct DemoCaseDefinition
@@ -54,6 +55,7 @@ struct DemoCaseDefinition
 	int initialStepsPerFrame;
 	float speedColorMax;
 	float vorticityColorMax;
+	float colorfulSaturation;   // 功能 4：colorful 视图颜色鲜艳度（0=全白，1=全鲜艳，随时间/方向渲染）
 	DemoFieldView defaultView;
 	bool hasMovableObstacle;
 	float obstacleStartX;
@@ -67,10 +69,9 @@ struct DemoCaseDefinition
 // 运行时预设（功能 3，§4.2）
 struct CasePreset
 {
-	const char* name;   // "Karman", "Karman+Smoke", "Jet", "Jet+Smoke", "Custom"
+	const char* name;   // "Karman", "Jet", "Custom"
 	DemoCaseId id;
 	DemoCaseDefinition def;  // 默认参数快照
-	bool smokeEnabled;       // 功能 4 预留，本期恒 false
 };
 
 // 返回 kCases[] 中对应 id 定义的拷贝（kCases 保持 const，作为"出厂默认值"来源）

@@ -28,6 +28,7 @@ namespace
 			15,
 			0.14f,
 			0.050f,
+			1.0f,
 			DemoFieldView::Vorticity,
 			true,
 			47.5f,
@@ -54,6 +55,7 @@ namespace
 			15,
 			0.10f,
 			0.030f,
+			1.0f,
 			DemoFieldView::VelocityMagnitude,
 			false,
 			0.0f,
@@ -175,9 +177,15 @@ float GetDemoCaseReynoldsNumber(const DemoCaseDefinition& definition)
 
 const char* GetDemoFieldViewName(DemoFieldView view)
 {
-	return view == DemoFieldView::Vorticity
-		? "signed vorticity"
-		: "velocity magnitude";
+	if (view == DemoFieldView::Vorticity)
+	{
+		return "signed vorticity";
+	}
+	if (view == DemoFieldView::Colorful)
+	{
+		return "colorful flow";
+	}
+	return "velocity magnitude";
 }
 
 MLLATTICENODE_FLAG GetDemoCaseBaseFlag(
@@ -413,14 +421,20 @@ void RefreshDemoCaseBoundaries(
 		WriteBoundaryMoments(flow, idx, neighborIdx, ux, uy);
 	}
 
-	// Top boundary (y = ny - 1): open outlet, copy interior velocity.
+	// Top boundary (y = ny - 1): open outlet. Use a convective (Orlanski)
+	// outlet that extrapolates the velocity toward the boundary from the two
+	// interior rows, letting vorticity leave the domain without reflecting
+	// perturbations back (important at high Reynolds numbers).
 	for (int x = 0; x < definition.nx; x++)
 	{
 		const int idx = (definition.ny - 1) * definition.nx + x;
 		const int neighborIdx = (definition.ny - 2) * definition.nx + x;
-		WriteBoundaryMoments(flow, idx, neighborIdx,
-			flow->fMom[neighborIdx * 6 + 1],
-			flow->fMom[neighborIdx * 6 + 2]);
+		const int secondIdx = (definition.ny - 3) * definition.nx + x;
+		const REAL ux = flow->fMom[neighborIdx * 6 + 1] -
+			0.9f * (flow->fMom[neighborIdx * 6 + 1] - flow->fMom[secondIdx * 6 + 1]);
+		const REAL uy = flow->fMom[neighborIdx * 6 + 2] -
+			0.9f * (flow->fMom[neighborIdx * 6 + 2] - flow->fMom[secondIdx * 6 + 2]);
+		WriteBoundaryMoments(flow, idx, neighborIdx, ux, uy);
 	}
 
 	// Left boundary (x = 0): wall for jet, outlet for Karman. Corners are
