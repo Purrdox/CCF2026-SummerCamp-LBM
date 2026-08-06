@@ -5,34 +5,38 @@
 #include "mrLbmSolverGpu2D.h"
 
 
+// CUDA 优化：1D 线性格点映射（256 线程/块）+ __restrict__ + #pragma unroll。
+// 连续线程映射到连续格点，warp 内访存完全合并；数值与原 2D 实现逐位一致
+// （仅内存布局与指令调度改变，物理公式未动）。
 __global__ void mrSolver2DKernel(
-	mrFlow2D* mlflow, /*float* vx_dev,*/ int sample_x, int sample_y, int sample_num)
+	mrFlow2D* __restrict__ mlflow, int sample_x, int sample_y, int sample_num)
 {
 	// ===== ASSIGNMENT FILL BEGIN: P1-C GPU LBM update kernel =====
-	// TODO: Implement one complete pull-streaming and collision update.
-	// 1. Map the CUDA thread to a lattice node and process ML_FLUID nodes only.
-	// 2. Pull each D2Q9 population from its upstream neighbor by reconstructing
-	//    it from the six stored moments.
-	// 3. Recover density, force-corrected velocity, and raw second moments.
-	// 4. Compute omega from viscosity, collide the second moments, normalize
-	//    them, and write all six values to fMomPost.
-	// Boundary and solid moments are prescribed by the case layer.
-	const int x = blockIdx.x * blockDim.x + threadIdx.x;
-	const int y = blockIdx.y * blockDim.y + threadIdx.y;
-	if (x >= sample_x || y >= sample_y)
+	// 1. 1D 线性映射：线程 → 格点序号 index，越界直接退出。
+	const int index = blockIdx.x * blockDim.x + threadIdx.x;
+	if (index >= sample_num)
 	{
 		return;
 	}
 
-	const int index = y * sample_x + x;
+	// 只处理流体格点（边界/固体矩由 case 层预写）。
 	if (mlflow[0].flag[index] != ML_FLUID)
 	{
 		return;
 	}
 
+	const int y = index / sample_x;
+	const int x = index - y * sample_x;
+
+	// 粘度为全场一致标量：松弛参数提前算一次，避免逐格重复访存与除法。
+	const REAL vis = mlflow[0].vis_shear;
+	const REAL tau = 0.5f + vis / cs2;
+	const REAL omega = 1.0f / tau;
+
 	// Pull streaming: reconstruct each population from its upstream neighbor.
 	mrUtilFuncGpu2D util;
 	REAL f[9];
+#pragma unroll
 	for (int i = 0; i < 9; i++)
 	{
 		int nx = x - (int)ex2d_gpu[i];
@@ -56,6 +60,7 @@ __global__ void mrSolver2DKernel(
 	REAL pixx_raw = 0.0f;
 	REAL piyy_raw = 0.0f;
 	REAL pixy_raw = 0.0f;
+#pragma unroll
 	for (int i = 0; i < 9; i++)
 	{
 		rho += f[i];
@@ -95,9 +100,7 @@ __global__ void mrSolver2DKernel(
 	}
 
 	// Collide the raw second moments with body-force correction.
-	const REAL vis = mlflow[0].vis_shear;
-	const REAL tau = 0.5f + vis / cs2;
-	const REAL omega = 1.0f / tau;
+	// （vis/tau/omega 已在格点入口处一次性算好，这里直接使用）
 	util.mlGetPIAfterCollision(
 		rho, ux, uy, Fx, Fy, omega, pixx_raw, piyy_raw, pixy_raw);
 
@@ -130,19 +133,19 @@ void mrSolver2DGpu(mrFlow2D* mlflow, MLFluidParam2D* param)
 	int sample_y = param->samples.y;
 	int sample_num = sample_x * sample_y;
 
-	dim3 threads1(BLOCK_NX, BLOCK_NY, 1);
-	dim3 grid1(
-		ceil(REAL(sample_x) / threads1.x),
-		ceil(REAL(sample_y) / threads1.y), 1
-	);
-	mrSolver2DKernel << <grid1, threads1 >> >
+	// CUDA 优化：256 线程 1D 块（原 8×8=64 线程 2D 块），线程线性映射格点，
+	// warp 访存完全合并；取消每步 cudaDeviceSynchronize()（异步队列化，消除
+	// 每步同步延迟）。正确性由帧末 CopyMomentsFromDevice 的 D2H 拷贝
+	// （cudaMemcpy 同步）隐式保证；错误由 GetLastError 在每步捕获。
+	const int threads1 = 256;
+	const int blocks1 = (sample_num + threads1 - 1) / threads1;
+	mrSolver2DKernel << <blocks1, threads1 >> >
 		(
 			mlflow,
 			sample_x, sample_y,
 			sample_num
 			);
 	checkCudaErrors(cudaGetLastError());
-	checkCudaErrors(cudaDeviceSynchronize());
 	mrSolver2D_step2Kernel << <1, 1 >> >
 		(
 			mlflow,
@@ -150,5 +153,4 @@ void mrSolver2DGpu(mrFlow2D* mlflow, MLFluidParam2D* param)
 			sample_num
 			);
 	checkCudaErrors(cudaGetLastError());
-	checkCudaErrors(cudaDeviceSynchronize());
 }

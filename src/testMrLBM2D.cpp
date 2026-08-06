@@ -7,6 +7,7 @@
 
 #include <windows.h>
 #include <windowsx.h>
+#include <commdlg.h>   // 存档/读档文件对话框（OPENFILENAME / GetSaveFileNameW / GetOpenFileNameW）
 #include <gl/GL.h>
 
 
@@ -30,6 +31,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <vector>
 
 #pragma comment(lib, "opengl32.lib")
+#pragma comment(lib, "comdlg32.lib")   // 存档/读档文件对话框（GetSaveFileNameW / GetOpenFileNameW）
 
 namespace
 {
@@ -97,6 +99,104 @@ namespace
 	bool IsFinite(REAL value)
 	{
 		return std::isfinite((double)value) != 0;
+	}
+
+	// ---- §4.3 存档/读档修正：可执行目录解析 + 保存/打开文件对话框 ----
+	// 原实现硬编码相对路径 "params.ini"，随进程工作目录漂移（IDE 启动、快捷方式
+	// 启动等场景目录不一致），导致保存位置不确定、读取找不到文件。改为对话框选路
+	// 径，初始目录固定为可执行文件所在目录。
+
+	// 可执行文件所在目录（含尾部分隔符；失败返回空串）
+	std::wstring GetExecutableDirectory()
+	{
+		wchar_t buffer[MAX_PATH] = {};
+		const DWORD length = GetModuleFileNameW(NULL, buffer, MAX_PATH);
+		std::wstring path(buffer, length > 0 ? length : 0);
+		const size_t slash = path.find_last_of(L"\\/");
+		if (slash != std::wstring::npos)
+		{
+			path.resize(slash + 1);
+		}
+		return path;
+	}
+
+	// 宽字符路径 → 窄字符路径（CP_ACP，与 std::ofstream/ifstream 的窄路径解释一致，
+	// 保证中文目录/文件名在中文系统上不损坏）
+	std::string WideToNarrowPath(const wchar_t* wide)
+	{
+		if (wide == NULL || wide[0] == L'\0')
+		{
+			return std::string();
+		}
+		const int length = WideCharToMultiByte(
+			CP_ACP, 0, wide, -1, NULL, 0, NULL, NULL);
+		if (length <= 1)
+		{
+			return std::string();
+		}
+		std::string result((size_t)length - 1, '\0');
+		WideCharToMultiByte(
+			CP_ACP, 0, wide, -1, &result[0], length, NULL, NULL);
+		return result;
+	}
+
+	// 保存对话框：返回用户选择的完整路径（默认名 params.ini，取消返回 false）
+	bool PromptSaveParamsFile(HWND owner, std::string& outPath)
+	{
+		wchar_t fileBuffer[MAX_PATH] = L"params.ini";
+		const std::wstring initialDir = GetExecutableDirectory();
+		OPENFILENAMEW ofn = {};
+		ofn.lStructSize = sizeof(ofn);
+		ofn.hwndOwner = owner;
+		ofn.lpstrFilter = L"INI files (*.ini)\0*.ini\0All files (*.*)\0*.*\0\0";
+		ofn.lpstrFile = fileBuffer;
+		ofn.nMaxFile = MAX_PATH;
+		ofn.lpstrInitialDir = initialDir.c_str();
+		ofn.lpstrDefExt = L"ini";
+		ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+		if (GetSaveFileNameW(&ofn) == 0)
+		{
+			return false;
+		}
+		outPath = WideToNarrowPath(fileBuffer);
+		return !outPath.empty();
+	}
+
+	// 打开对话框：返回用户选择的文件（取消返回 false）
+	bool PromptOpenParamsFile(HWND owner, std::string& outPath)
+	{
+		wchar_t fileBuffer[MAX_PATH] = {};
+		const std::wstring initialDir = GetExecutableDirectory();
+		OPENFILENAMEW ofn = {};
+		ofn.lStructSize = sizeof(ofn);
+		ofn.hwndOwner = owner;
+		ofn.lpstrFilter = L"INI files (*.ini)\0*.ini\0All files (*.*)\0*.*\0\0";
+		ofn.lpstrFile = fileBuffer;
+		ofn.nMaxFile = MAX_PATH;
+		ofn.lpstrInitialDir = initialDir.c_str();
+		ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+		if (GetOpenFileNameW(&ofn) == 0)
+		{
+			return false;
+		}
+		outPath = WideToNarrowPath(fileBuffer);
+		return !outPath.empty();
+	}
+
+	// 可执行目录下 params.ini 的完整窄路径（启动自动加载用；目录解析失败回退相对路径）
+	std::string GetDefaultParamsPath()
+	{
+		const std::wstring directory = GetExecutableDirectory();
+		if (!directory.empty())
+		{
+			const std::string narrow = WideToNarrowPath(
+				(directory + L"params.ini").c_str());
+			if (!narrow.empty())
+			{
+				return narrow;
+			}
+		}
+		return "params.ini";
 	}
 
 	Moments2D ReadMoments(const mrFlow2D* flow, int index)
@@ -1804,14 +1904,24 @@ namespace
 
 		void ToggleFieldView()
 		{
-			// 功能 4/6：四视图循环 Velocity → Vorticity → Colorful → Smoke → Velocity（V 键）
-			fieldView = fieldView == DemoFieldView::VelocityMagnitude
-				? DemoFieldView::Vorticity
-				: (fieldView == DemoFieldView::Vorticity
-					? DemoFieldView::Colorful
-					: (fieldView == DemoFieldView::Colorful
-						? DemoFieldView::Smoke
-						: DemoFieldView::VelocityMagnitude));
+			// V 键三视图循环 Velocity → Vorticity → Smoke → Velocity。
+			// Colorful 视图已从默认循环中去除，仅保留在面板 Field view 下拉中手动切换进入。
+			if (fieldView == DemoFieldView::VelocityMagnitude)
+			{
+				fieldView = DemoFieldView::Vorticity;
+			}
+			else if (fieldView == DemoFieldView::Vorticity)
+			{
+				fieldView = DemoFieldView::Smoke;
+			}
+			else if (fieldView == DemoFieldView::Smoke)
+			{
+				fieldView = DemoFieldView::VelocityMagnitude;
+			}
+			else   // Colorful（手动进入）：按基本循环的起点继续
+			{
+				fieldView = DemoFieldView::VelocityMagnitude;
+			}
 			if (initialized)
 			{
 				BuildFieldImage(flow, definition, fieldView, pixels, smoke.data());
@@ -2020,6 +2130,20 @@ namespace
 		std::array<RigidBody, kMaxBodies> bodies = {};
 	};
 	LoadedStartupParams gLoadedParams;
+
+	// §4.3 存档/读档修正：最近一次成功保存/加载的路径（成功弹窗显示用）
+	std::string gLastParamsPath;
+
+	// §4.3 存档/读档严重 bug 修复：文件对话框（GetSaveFileNameW/GetOpenFileNameW）的
+	// 模态消息循环会在帧内派发 WM_TIMER/WM_PAINT，若在 ImGui 帧内（BuildAppUi）直接调用，
+	// 会触发嵌套的 ImGui::NewFrame/Render，导致 ImGui 内部状态损坏而闪退。
+	// 因此按钮只置 pending，对话框统一延迟到 ImGui 帧结束后（Render 尾部）执行。
+	enum class PendingParamsAction { None, Save, Load };
+	PendingParamsAction gPendingParamsAction = PendingParamsAction::None;
+
+	// 延迟动作的执行结果：由下一帧的 BuildAppUi 消费并弹出成功/失败提示
+	enum class ParamsActionResult { None, SaveOk, SaveFailed, LoadOk, LoadFailed };
+	ParamsActionResult gParamsActionResult = ParamsActionResult::None;
 
 	// §4.3 优先级约定：命令行显式 --case 时 ini 不覆盖 case（只覆盖其余参数）
 	bool gCaseSpecifiedOnCommandLine = false;
@@ -2946,6 +3070,10 @@ namespace
 	void ApplyUiSizeMode(HWND window, UiSizeMode mode);
 	// 请求 2/4：以当前全部设置重建算例（Jet 调参 / Restart 共用）
 	void RestartWithCurrentSettings(HWND window);
+	// §4.3 存档/读档严重 bug 修复：帧末延迟执行文件对话框（定义在
+	// ApplyLoadedStartupParams 之后，Render 经此前置声明调用）。
+	// 对话框的模态消息循环在帧内会触发嵌套 ImGui 帧导致闪退，故放帧末。
+	void HandlePendingParamsAction(HWND window);
 
 	// §5.2/§5.3 右侧 ImGui 面板：UI SIZE / SIMULATION / CASE·PRESET / PARAMETERS
 	// / OBJECTS / TOOLS(预留) / EDIT MODE(预留) / DEBUG(预留) / CONTROLS。
@@ -3072,58 +3200,58 @@ namespace
 			}
 			ImGui::SameLine();
 			// §4.3 保存/读取参数文件（ParamsIO，M4c）
+			// 修正 1：改用文件对话框选路径（初始目录 = 可执行目录），不再依赖工作目录。
+			// 修正 2：对话框不得在本帧内弹出（模态消息循环会触发嵌套 ImGui 帧闪退），
+			// 按钮仅置 pending，由 Render 帧末 HandlePendingParamsAction 延迟执行。
 			if (ImGui::Button("Save ini"))
 			{
-				if (!SaveAppParams(
-					"params.ini",
-					gApp.definition,
-					gApp.fieldView,
-					gApp.stepsPerFrame,
-					gApp.obstacleShape,
-					gApp.bodyCount,
-					gApp.bodies.data()))
-				{
-					ImGui::OpenPopup("params_save_failed");
-				}
+				gPendingParamsAction = PendingParamsAction::Save;
 			}
 			ImGui::SameLine();
 			if (ImGui::Button("Load ini"))
 			{
-				// 以当前 case 为基底读取，面板内允许 ini 的 case 生效
-				LoadedStartupParams loaded;
-				loaded.caseId = gApp.caseId;
-				loaded.valid = LoadAppParams(
-					"params.ini",
-					loaded.caseId,
-					loaded.def,
-					loaded.view,
-					loaded.stepsPerFrame,
-					loaded.shape,
-					loaded.bodyCount,
-					loaded.bodies.data(),
-					true);
-				if (loaded.valid)
+				gPendingParamsAction = PendingParamsAction::Load;
+			}
+			// 消费延迟动作结果：弹出成功/失败提示（含最近一次操作的路径）
+			if (gParamsActionResult != ParamsActionResult::None)
+			{
+				switch (gParamsActionResult)
 				{
-					gLoadedParams = loaded;
-					ApplyLoadedStartupParams(window);
-					UpdateWindowTitle(window);
-					// 请求 3：无 Custom 标记——按 case 归位基础预设（Karman=0 / Jet=1）
-					gActivePreset =
-						loaded.caseId == DemoCaseId::KarmanVortex ? 0 : 1;
-				}
-				else
-				{
+				case ParamsActionResult::SaveOk:
+					ImGui::OpenPopup("params_save_ok");
+					break;
+				case ParamsActionResult::SaveFailed:
+					ImGui::OpenPopup("params_save_failed");
+					break;
+				case ParamsActionResult::LoadOk:
+					ImGui::OpenPopup("params_load_ok");
+					break;
+				case ParamsActionResult::LoadFailed:
 					ImGui::OpenPopup("params_load_failed");
+					break;
+				default:
+					break;
 				}
+				gParamsActionResult = ParamsActionResult::None;
 			}
 			if (ImGui::BeginPopup("params_save_failed"))
 			{
-				ImGui::Text("Failed to write params.ini");
+				ImGui::Text("Failed to write the params file");
 				ImGui::EndPopup();
 			}
 			if (ImGui::BeginPopup("params_load_failed"))
 			{
-				ImGui::Text("params.ini not found or unreadable");
+				ImGui::Text("params file not found or unreadable");
+				ImGui::EndPopup();
+			}
+			if (ImGui::BeginPopup("params_save_ok"))
+			{
+				ImGui::Text("Saved: %s", gLastParamsPath.c_str());
+				ImGui::EndPopup();
+			}
+			if (ImGui::BeginPopup("params_load_ok"))
+			{
+				ImGui::Text("Loaded: %s", gLastParamsPath.c_str());
 				ImGui::EndPopup();
 			}
 		}
@@ -3439,8 +3567,8 @@ namespace
 		if (ImGui::CollapsingHeader("CONTROLS"))
 		{
 			ImGui::TextWrapped(
-				"1/2 case | V view | Space pause | S step | +/- steps\n"
-				"R reset | Tab select | Arrows move | Esc quit");
+				"1/2 case | V view (Vel/Vort/Smoke) | Space pause | S step | +/- steps\n"
+				"R tap restart | R hold reset | Tab select | Arrows move | Ctrl debug | Esc quit");
 		}
 
 		ImGui::End();
@@ -3517,6 +3645,11 @@ namespace
 		BuildAppUi(window, layout);
 		ImGui::Render();
 		ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
+
+		// §4.3 存档/读档严重 bug 修复：ImGui 帧结束后再弹文件对话框。
+		// 对话框模态消息循环派发的 WM_PAINT 会触发本 Render 的嵌套调用，
+		// 嵌套时生成的 ImGui 帧是全新的（外层帧已 Render 完毕），不会闪退。
+		HandlePendingParamsAction(window);
 
 		SwapBuffers(gDeviceContext);
 	}
@@ -3644,6 +3777,77 @@ namespace
 
 		RebuildLegendTexture();   // §5.5 色条内容随 fieldView
 		InvalidateRect(window, NULL, FALSE);
+	}
+
+	// §4.3 存档/读档严重 bug 修复：帧末延迟执行文件对话框与参数读写。
+	// 在 Render 尾部（ImGui 帧已结束、SwapBuffers 前）调用：此时弹出对话框，
+	// 其模态消息循环派发的 WM_TIMER/WM_PAINT 会创建全新 ImGui 帧（嵌套安全），
+	// 不再破坏外层帧状态。结果存入 gParamsActionResult，由下一帧 BuildAppUi 弹窗。
+	void HandlePendingParamsAction(HWND window)
+	{
+		if (gPendingParamsAction == PendingParamsAction::None)
+		{
+			return;
+		}
+		const PendingParamsAction action = gPendingParamsAction;
+		gPendingParamsAction = PendingParamsAction::None;   // 先清 pending，防重入
+
+		std::string path;
+		if (action == PendingParamsAction::Save)
+		{
+			if (PromptSaveParamsFile(window, path))
+			{
+				if (SaveAppParams(
+					path.c_str(),
+					gApp.definition,
+					gApp.fieldView,
+					gApp.stepsPerFrame,
+					gApp.obstacleShape,
+					gApp.bodyCount,
+					gApp.bodies.data()))
+				{
+					gLastParamsPath = path;
+					gParamsActionResult = ParamsActionResult::SaveOk;
+				}
+				else
+				{
+					gParamsActionResult = ParamsActionResult::SaveFailed;
+				}
+			}
+		}
+		else if (action == PendingParamsAction::Load)
+		{
+			if (PromptOpenParamsFile(window, path))
+			{
+				LoadedStartupParams loaded;
+				loaded.caseId = gApp.caseId;
+				loaded.valid = LoadAppParams(
+					path.c_str(),
+					loaded.caseId,
+					loaded.def,
+					loaded.view,
+					loaded.stepsPerFrame,
+					loaded.shape,
+					loaded.bodyCount,
+					loaded.bodies.data(),
+					true);
+				if (loaded.valid)
+				{
+					gLoadedParams = loaded;
+					ApplyLoadedStartupParams(window);
+					UpdateWindowTitle(window);
+					// 预设索引同步：载入的 case 只有 Karman(0) / Jet(1)
+					gActivePreset =
+						loaded.caseId == DemoCaseId::KarmanVortex ? 0 : 1;
+					gLastParamsPath = path;
+					gParamsActionResult = ParamsActionResult::LoadOk;
+				}
+				else
+				{
+					gParamsActionResult = ParamsActionResult::LoadFailed;
+				}
+			}
+		}
 	}
 
 	// 请求 1：UI 大小模式切换。小 = 当前默认窗口（1040×820）；
@@ -4154,9 +4358,12 @@ int main(int argc, char** argv)
 
 	// §4.3 启动加载：读 params.ini 存入模块级 gLoadedParams，WM_CREATE 后分发。
 	// 优先级约定（写死）：命令行显式 --case 时 ini 不覆盖 case（applyFileCase=false）。
+	// 修正：优先读可执行目录下的 params.ini（与 Save/Load 对话框的初始目录一致），
+	// 找不到再回退工作目录相对路径（兼容旧版）。
 	gLoadedParams.caseId = gStartupCase;
+	const std::string startupParamsPath = GetDefaultParamsPath();
 	gLoadedParams.valid = LoadAppParams(
-		"params.ini",
+		startupParamsPath.c_str(),
 		gLoadedParams.caseId,
 		gLoadedParams.def,
 		gLoadedParams.view,
@@ -4165,6 +4372,20 @@ int main(int argc, char** argv)
 		gLoadedParams.bodyCount,
 		gLoadedParams.bodies.data(),
 		!gCaseSpecifiedOnCommandLine);
+	if (!gLoadedParams.valid && startupParamsPath != "params.ini")
+	{
+		gLoadedParams.caseId = gStartupCase;
+		gLoadedParams.valid = LoadAppParams(
+			"params.ini",
+			gLoadedParams.caseId,
+			gLoadedParams.def,
+			gLoadedParams.view,
+			gLoadedParams.stepsPerFrame,
+			gLoadedParams.shape,
+			gLoadedParams.bodyCount,
+			gLoadedParams.bodies.data(),
+			!gCaseSpecifiedOnCommandLine);
+	}
 	if (gLoadedParams.valid)
 	{
 		std::cout << "Loaded params.ini (case="
