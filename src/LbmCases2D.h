@@ -34,7 +34,8 @@ enum class DemoFieldView
 {
 	VelocityMagnitude,
 	Vorticity,
-	Colorful   // 功能 4：rho/ux/uy 流场着色（平静=白，快速=鲜艳+时间旋转）
+	Colorful,   // 功能 4：rho/ux/uy 流场着色（平静=白，快速=鲜艳+时间旋转）
+	Smoke       // 烟雾视图：仅显示烟雾状态（被动标量颜色场），不含任何常规流体信息
 };
 
 struct DemoCaseDefinition

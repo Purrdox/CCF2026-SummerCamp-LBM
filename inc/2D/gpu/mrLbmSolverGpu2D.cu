@@ -68,8 +68,31 @@ __global__ void mrSolver2DKernel(
 
 	const REAL Fx = mlflow[0].forcex[index];
 	const REAL Fy = mlflow[0].forcey[index];
-	const REAL ux = (ux_times_rho + 0.5f * Fx) / rho;
-	const REAL uy = (uy_times_rho + 0.5f * Fy) / rho;
+	REAL ux = (ux_times_rho + 0.5f * Fx) / rho;
+	REAL uy = (uy_times_rho + 0.5f * Fy) / rho;
+
+	// 速度上限锁：密度退化（越界 / NaN）时把该格点重置为平衡态，否则把
+	// 速度幅值限制在 umax2d_gpu 以内。防止高流速 / 强外力下 rho 除零产生
+	// NaN 并逐格扩散导致程序崩溃。
+	if (rho < 0.5f || rho > 1.5f || !isfinite(ux) || !isfinite(uy))
+	{
+		rho = 1.0f;
+		ux = 0.0f;
+		uy = 0.0f;
+		pixx_raw = rho * cs2;
+		piyy_raw = rho * cs2;
+		pixy_raw = 0.0f;
+	}
+	else
+	{
+		const REAL speed = sqrtf(ux * ux + uy * uy);
+		if (speed > umax2d_gpu)
+		{
+			const REAL scale = umax2d_gpu / speed;
+			ux *= scale;
+			uy *= scale;
+		}
+	}
 
 	// Collide the raw second moments with body-force correction.
 	const REAL vis = mlflow[0].vis_shear;

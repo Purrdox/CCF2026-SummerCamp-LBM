@@ -34,6 +34,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 namespace
 {
 	const int kTimerMilliseconds = 16;
+	const int kRLongPressMilliseconds = 500;   // 请求 2：R 键长按判定阈值（≥ 即 reset）
 	const int kPanelWidth = 350;
 	const int kMinimumStepsPerFrame = 1;
 	const int kMaximumStepsPerFrame = 50;
@@ -41,8 +42,18 @@ namespace
 	const float kMaximumWallSpeed = 0.25f;   // 请求 5：提高物体拖动/移动速度上限
 	const int kInverseDirection[9] = { 0, 3, 4, 1, 2, 7, 8, 5, 6 };
 
+	// 功能 5：Ctrl 放大镜参数（评估文档 §6.2-5A 局部放大镜）
+	const int kMagnifierRadius = 8;         // 放大镜半径（格数，中心 ±8 格）
+	const float kMagnifierMaxSize = 220.0f; // 放大镜在屏幕上的最大边长（px）
+	const float kTextCharWidth = 9.0f;      // 位图字体单字符宽（Consolas 16px 估算）
+	const float kTextLineHeight = 18.0f;    // 位图字体行高（估算）
+
 	// 功能 4（colorful 视图）：力幅度上限
 	const float kFmax = 0.02f;            // §5.3 力幅度上限（与 blowStrength 滑块上限一致）
+
+	// 烟雾背景色（请求 3）：较浅的灰色。未注入烟雾的区域 / 边界格点 / 烟场未就绪时
+	// 的兜底色，与白色烟团（1,1,1）及调色板注入色形成对比。
+	const float kSmokeBackground[3] = { 0.82f, 0.82f, 0.82f };
 
 	struct Moments2D
 	{
@@ -164,6 +175,18 @@ namespace
 			host->fMom,
 			deviceCopy.fMom,
 			host->count * 6 * sizeof(REAL),
+			cudaMemcpyDeviceToHost));
+		// 功能 5：forcex/forcey 一并拷回 host，供格点调试信息显示
+		//（设备端每步核迭代都会读它，host 值不拷回会失真）
+		checkCudaErrors(_MLCuMemcpy(
+			host->forcex,
+			deviceCopy.forcex,
+			host->count * sizeof(REAL),
+			cudaMemcpyDeviceToHost));
+		checkCudaErrors(_MLCuMemcpy(
+			host->forcey,
+			deviceCopy.forcey,
+			host->count * sizeof(REAL),
 			cudaMemcpyDeviceToHost));
 	}
 
@@ -586,7 +609,8 @@ namespace
 		const mrFlow2D* flow,
 		const DemoCaseDefinition& definition,
 		DemoFieldView view,
-		std::vector<unsigned char>& pixels)
+		std::vector<unsigned char>& pixels,
+		const REAL* smokeRgb = nullptr)   // 烟雾视图数据（§5.2）；NULL 时退化为白色
 	{
 		const int nx = definition.nx;
 		const int ny = definition.ny;
@@ -608,6 +632,10 @@ namespace
 				if (view == DemoFieldView::Colorful)
 				{
 					continue;   // colorful 视图：不需要标量场，直接按 rho/ux/uy 上色
+				}
+				if (view == DemoFieldView::Smoke)
+				{
+					continue;   // smoke 视图：直接按烟色上色，不需要标量场
 				}
 
 				const int left = y * nx + std::max(0, x - 1);
@@ -685,6 +713,24 @@ namespace
 					r = 0.16f;
 					g = 0.18f;
 					b = 0.20f;
+				}
+				else if (view == DemoFieldView::Smoke)
+				{
+					// 烟雾视图（§5.2 + 请求 3）：只显示烟雾状态，不显示任何常规流体信息。
+					// 固体/壁面已由上面分支判为深色，其余格点 = 烟色（背景为较浅的灰色）。
+					if (smokeRgb != NULL)
+					{
+						r = smokeRgb[index * 3 + 0];
+						g = smokeRgb[index * 3 + 1];
+						b = smokeRgb[index * 3 + 2];
+					}
+					else
+					{
+						// NULL 保护：烟场未就绪时退化为背景灰
+						r = kSmokeBackground[0];
+						g = kSmokeBackground[1];
+						b = kSmokeBackground[2];
+					}
 				}
 				else if (view == DemoFieldView::Colorful)
 				{
@@ -789,10 +835,19 @@ namespace
 		float grabOffsetY = 0.0f;
 
 		// 功能 4（colorful 交互）
-		enum class InteractionTool { None, Blow, Vortex };
+		enum class InteractionTool { None, PaintSmoke, Eraser, Blow, Vortex };
 		InteractionTool activeTool = InteractionTool::None;
 		float brushRadius = 6.0f;
 		float blowStrength = 0.004f;
+
+		// 烟雾场（被动标量，纯 host，不参与 GPU 求解）
+		std::vector<REAL> smoke;          // RGB 交错，长度 count*3，每格 (r,g,b)；背景=浅灰，初始烟=中心白色烟团
+		std::vector<REAL> smokeScratch;   // 平流双缓冲（读旧写新）
+		float brushStrength = 1.0f;       // 请求 2：笔刷强度（0=不施加影响，1=立即将整个笔刷区域设为目标值）
+		float smokeColor[3] = { 0.90f, 0.45f, 0.10f };  // 调色板默认色（暖橙，白底可见）
+		float smokeTemperature = 0.0f;    // 请求 1：自然扩散强度（0=不扩散，越大扩散越快，Smoke 工具面板可调）
+		bool smokeToolAutoView = true;    // 选中 PaintSmoke 时自动切到 Smoke 视图（§4.3）
+		float smokeFade = 0.0f;           // 可选：每帧向背景灰松弛系数（0=纯平流，§3.8）
 
 		// 功能 4（colorful，§2 新增成员）
 		HWND appWindow = NULL;               // 窗口句柄：hover 豁免需现算 layout（§5.4）
@@ -802,12 +857,13 @@ namespace
 		float blowDirX = 0.0f;               // 本帧吹风方向（屏幕差分 → 格点方向，§5.5）
 		float blowDirY = 1.0f;
 
-		// 功能 5 预留（Ctrl 调试 + 放大，§1.4）
+		// 功能 5（Ctrl 调试 + 放大，§6）：ctrlHeld 驱动，松开即消失
 		bool ctrlHeld = false;
-		bool debugMode = false;
 		int debugCellX = -1;
 		int debugCellY = -1;
-		bool magnifierEnabled = false;
+		// 请求 2：R 键短按 restart / 长按 reset——按下记录时刻，松开按按住时长分发
+		ULONGLONG rPressStartTick = 0;
+		bool showFps = false;   // 请求 1：FPS/每步耗时 HUD 显示开关（Debug 栏，默认关闭）
 
 		bool moveLeft = false;
 		bool moveRight = false;
@@ -836,6 +892,8 @@ namespace
 			solver.lbmvec.clear();
 			solver.lbm_dev_gpu.clear();
 			pixels.clear();
+			smoke.clear();          // 烟雾场与网格同生命周期（§2.2）
+			smokeScratch.clear();
 			initialized = false;
 		}
 
@@ -886,6 +944,36 @@ namespace
 			injectedForceCells.clear();
 			prevMouseScreenX = prevMouseScreenY = 0;
 
+			// 烟雾场复位（§2.2 + 请求 2/3）：背景为较浅的灰色（kSmokeBackground），
+			// 初始烟雾集中为一个白色烟团（场地中心、软边渐隐），不再全场铺满白烟；
+			// 须在末尾 BuildFieldImage 之前完成，否则 Smoke 视图首帧读到脏数据。
+			smoke.resize((size_t)definition.nx * (size_t)definition.ny * 3);
+			const float cloudCx = (float)definition.nx * 0.5f;
+			const float cloudCy = (float)definition.ny * 0.5f;
+			const float cloudR0 = std::max(
+				3.0f, (float)std::min(definition.nx, definition.ny) * 0.16f); // 内圈（纯白）
+			const float cloudR1 = cloudR0 * 2.0f;   // 外圈（软边，渐隐回背景灰）
+			for (int y = 0; y < definition.ny; y++)
+			{
+				for (int x = 0; x < definition.nx; x++)
+				{
+					const int idx = (y * definition.nx + x) * 3;
+					const float dx = (float)x + 0.5f - cloudCx;
+					const float dy = (float)y + 0.5f - cloudCy;
+					const float dist = sqrtf(dx * dx + dy * dy);
+					const float t = ClampFloat(
+						(cloudR1 - dist) / (cloudR1 - cloudR0), 0.0f, 1.0f);
+					// 背景灰 → 白 插值（t=0 背景，t=1 纯白烟）
+					smoke[idx + 0] = kSmokeBackground[0] +
+						t * (1.0f - kSmokeBackground[0]);
+					smoke[idx + 1] = kSmokeBackground[1] +
+						t * (1.0f - kSmokeBackground[1]);
+					smoke[idx + 2] = kSmokeBackground[2] +
+						t * (1.0f - kSmokeBackground[2]);
+				}
+			}
+			smokeScratch.resize((size_t)definition.nx * (size_t)definition.ny * 3);
+
 			flow = new mrFlow2D();
 			flow->Create(
 				0.0f,
@@ -909,7 +997,7 @@ namespace
 			solver.AttachLbmDevice(deviceFlows);
 			solver.mlTransData2Gpu();
 
-			BuildFieldImage(flow, definition, fieldView, pixels);
+			BuildFieldImage(flow, definition, fieldView, pixels, smoke.data());
 			initialized = true;
 		}
 
@@ -1394,6 +1482,41 @@ namespace
 						injectedForceCells.push_back(idx);
 						break;
 					}
+					case InteractionTool::PaintSmoke:
+					{
+						// 请求 2：brushStrength 控制施加烟雾的量——0 不施加影响；
+						// 1 时立即将整个笔刷区域（外层圆判据已限定）设为调色板色，整区均匀无衰减。
+						// 纯 host 数据（不写力、不收集 injectedForceCells），无需同步。
+						if (brushStrength > 0.0f)
+						{
+							const float amount = ClampFloat(brushStrength, 0.0f, 1.0f);
+							for (int c = 0; c < 3; c++)
+							{
+								smoke[idx * 3 + c] = ClampFloat(
+									smoke[idx * 3 + c] +
+										amount * (smokeColor[c] - smoke[idx * 3 + c]),
+									0.0f, 1.0f);
+							}
+						}
+						break;
+					}
+					case InteractionTool::Eraser:
+					{
+						// 请求 2：brushStrength 控制削减烟雾的量——0 不施加影响；
+						// 1 时立即将整个笔刷区域的烟雾擦除为背景灰（整区均匀）。
+						if (brushStrength > 0.0f)
+						{
+							const float amount = ClampFloat(brushStrength, 0.0f, 1.0f);
+							for (int c = 0; c < 3; c++)
+							{
+								smoke[idx * 3 + c] = ClampFloat(
+									smoke[idx * 3 + c] +
+										amount * (kSmokeBackground[c] - smoke[idx * 3 + c]),
+									0.0f, 1.0f);
+							}
+						}
+						break;
+					}
 					case InteractionTool::None:
 					default:
 						break;
@@ -1456,7 +1579,8 @@ namespace
 			const bool uiCaptures = UiWantsCaptureMouse();
 
 			// 左键：Shift+左键 = Blow（覆盖 activeTool）；未命中物体时按 activeTool
-			if (lButtonDown && !dragging && !overPanel && !uiCaptures)
+			// 功能 5：Ctrl 调试模式下不执行任何力源/画笔工具
+			if (lButtonDown && !dragging && !overPanel && !uiCaptures && !ctrlHeld)
 			{
 				const bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 				InteractionTool tool =
@@ -1467,11 +1591,186 @@ namespace
 				}
 			}
 
-			// 中键：旋涡（不依赖工具选择，恒可用）
-			if (mButtonDown && !overPanel && !uiCaptures)
+			// 中键：旋涡（不依赖工具选择，恒可用；Ctrl 模式下让位给调试）
+			if (mButtonDown && !overPanel && !uiCaptures && !ctrlHeld)
 			{
 				ApplyToolAt(
 					mouseFieldX, mouseFieldY, InteractionTool::Vortex, true);
+			}
+		}
+
+		// 烟雾平流（§3）：被动标量半拉格朗日平流。纯 host，每 UI 帧一次；
+		// 速度源 = 本帧 CopyMomentsFromDevice 后的 fMom[1/2]，
+		// dt = stepsPerFrame（一 UI 帧推进 N 个 LBM 步，delta_t = 1 格点单位）。
+		// 边界格点强制置白（入口洁净/出口不堆积/壁面无烟），固体保持自身旧值（烟不穿壁）。
+		void AdvectSmoke()
+		{
+			const int nx = definition.nx;
+			const int ny = definition.ny;
+			const int cells = nx * ny;
+			if ((int)smoke.size() != cells * 3)
+			{
+				return;   // Init 未完成，防御
+			}
+			smokeScratch.resize((size_t)cells * 3);
+
+			const REAL dt = (REAL)stepsPerFrame;
+			const int substeps = std::max(1, (int)std::ceil(dt / 0.75f));
+			const REAL dtStep = dt / (REAL)substeps;
+
+			for (int s = 0; s < substeps; s++)
+			{
+				for (int y = 0; y < ny; y++)
+				{
+					for (int x = 0; x < nx; x++)
+					{
+						const int idx = y * nx + x;
+						const MLLATTICENODE_FLAG flag = flow->flag[idx];
+
+						// 边界（INLET/OUTLET/WALL_*，含非流体非固体枚举）强制置为背景色
+						if (flag != ML_FLUID && flag != ML_SOLID)
+						{
+							smokeScratch[idx * 3 + 0] = kSmokeBackground[0];
+							smokeScratch[idx * 3 + 1] = kSmokeBackground[1];
+							smokeScratch[idx * 3 + 2] = kSmokeBackground[2];
+							continue;
+						}
+						// 固体保持自身旧值：烟不穿壁
+						if (flag == ML_SOLID)
+						{
+							smokeScratch[idx * 3 + 0] = smoke[idx * 3 + 0];
+							smokeScratch[idx * 3 + 1] = smoke[idx * 3 + 1];
+							smokeScratch[idx * 3 + 2] = smoke[idx * 3 + 2];
+							continue;
+						}
+
+						REAL ux = flow->fMom[idx * 6 + 1];
+						REAL uy = flow->fMom[idx * 6 + 2];
+						// 请求 1：inlet 有流速（inletUx/inletUy 非全 0）时，若某格点速度恰为
+						// (0,0)（静止死区/对称驻点），加一个微小扰动打破僵局，避免烟雾在此滞留。
+						// 扰动为确定性伪随机方向、幅度 1e-3 格点单位（对主流场可忽略）。
+						if (ux == 0.0f && uy == 0.0f &&
+							(definition.inletUx != 0.0f || definition.inletUy != 0.0f))
+						{
+							const unsigned int seed =
+								(unsigned int)idx * 2654435761u +
+								(unsigned int)iteration * 40503u;
+							const float ru =
+								(float)(seed & 0xFFFFu) / 65535.0f;   // [0,1)
+							const float rv =
+								(float)((seed >> 16) & 0xFFFFu) / 65535.0f;
+							const REAL perturb = 1.0e-3f;
+							ux = perturb * (2.0f * ru - 1.0f);
+							uy = perturb * (2.0f * rv - 1.0f);
+						}
+						// 数值守卫：速度非有限或超上限时保持旧值，防 NaN 蔓延
+						if (!IsFinite(ux) || !IsFinite(uy) ||
+							ux * ux + uy * uy > 1.0f)
+						{
+							smokeScratch[idx * 3 + 0] = smoke[idx * 3 + 0];
+							smokeScratch[idx * 3 + 1] = smoke[idx * 3 + 1];
+							smokeScratch[idx * 3 + 2] = smoke[idx * 3 + 2];
+							continue;
+						}
+
+						// 半拉格朗日回溯 + 双线性插值（clamp 与 GPU kernel 同风格）
+						const REAL xb = (REAL)x - ux * dtStep;
+						const REAL yb = (REAL)y - uy * dtStep;
+						int i0 = (int)std::floor(xb);
+						int j0 = (int)std::floor(yb);
+						if (i0 < 0) i0 = 0;
+						if (i0 >= nx) i0 = nx - 1;
+						if (j0 < 0) j0 = 0;
+						if (j0 >= ny) j0 = ny - 1;
+						const int i1 = std::min(i0 + 1, nx - 1);
+						const int j1 = std::min(j0 + 1, ny - 1);
+
+						// 采样邻域含固体 → 回退取自身旧值（烟贴边滞留，不穿壁）
+						if (flow->flag[j0 * nx + i0] == ML_SOLID ||
+							flow->flag[j0 * nx + i1] == ML_SOLID ||
+							flow->flag[j1 * nx + i0] == ML_SOLID ||
+							flow->flag[j1 * nx + i1] == ML_SOLID)
+						{
+							smokeScratch[idx * 3 + 0] = smoke[idx * 3 + 0];
+							smokeScratch[idx * 3 + 1] = smoke[idx * 3 + 1];
+							smokeScratch[idx * 3 + 2] = smoke[idx * 3 + 2];
+							continue;
+						}
+
+						const float fx = (float)(xb - (REAL)i0);
+						const float fy = (float)(yb - (REAL)j0);
+						for (int c = 0; c < 3; c++)
+						{
+							const REAL s00 = smoke[(j0 * nx + i0) * 3 + c];
+							const REAL s10 = smoke[(j0 * nx + i1) * 3 + c];
+							const REAL s01 = smoke[(j1 * nx + i0) * 3 + c];
+							const REAL s11 = smoke[(j1 * nx + i1) * 3 + c];
+							const REAL top = (1.0f - fx) * s00 + fx * s10;
+							const REAL bot = (1.0f - fx) * s01 + fx * s11;
+							smokeScratch[idx * 3 + c] =
+								ClampFloat((1.0f - fy) * top + fy * bot, 0.0f, 1.0f);
+						}
+					}
+				}
+				// 子步回拷：smoke 始终是"当前最新"，下一子步继续读它 → 子步间自然级联
+				std::copy(smokeScratch.begin(), smokeScratch.end(), smoke.begin());
+			}
+
+			// 请求 1：自然扩散——smokeTemperature > 0 时烟雾向四周扩散，
+			// 无气流（速度≈0）时也扩散。4 邻域中心差分 + 反射边界（非流体邻域取自身，
+			// 不流失质量）；每子步系数 k = D·dtStep，D ≤ 0.05 时 k ≤ 0.0375 < 0.25，
+			// 显式格式逐子步稳定。扩散只作用流体格点，固体/边界保持平流已写入的值。
+			if (smokeTemperature > 0.0f)
+			{
+				const REAL diffusion =
+					std::min(smokeTemperature, 1.0f) * 0.05f;   // 扩散系数（格点单位，整体降速）
+				const REAL k = diffusion * dtStep;              // 每子步扩散强度
+				const REAL keep = 1.0f - 4.0f * k;              // 自身保留权重（≥0.4）
+				for (int s = 0; s < substeps; s++)
+				{
+					for (int y = 0; y < ny; y++)
+					{
+						for (int x = 0; x < nx; x++)
+						{
+							const int idx = y * nx + x;
+							if (flow->flag[idx] != ML_FLUID)
+							{
+								continue;   // 固体/边界不参与扩散
+							}
+							// 上/下/左/右邻域；非流体/越界邻域反射为自身
+							const int up = y > 0 &&
+								flow->flag[idx - nx] == ML_FLUID ? idx - nx : idx;
+							const int down = y < ny - 1 &&
+								flow->flag[idx + nx] == ML_FLUID ? idx + nx : idx;
+							const int left = x > 0 &&
+								flow->flag[idx - 1] == ML_FLUID ? idx - 1 : idx;
+							const int right = x < nx - 1 &&
+								flow->flag[idx + 1] == ML_FLUID ? idx + 1 : idx;
+							for (int c = 0; c < 3; c++)
+							{
+								const REAL sum =
+									smoke[up * 3 + c] + smoke[down * 3 + c] +
+									smoke[left * 3 + c] + smoke[right * 3 + c];
+								smokeScratch[idx * 3 + c] = ClampFloat(
+									keep * smoke[idx * 3 + c] + k * sum,
+									0.0f, 1.0f);
+							}
+						}
+					}
+					std::copy(smokeScratch.begin(), smokeScratch.end(), smoke.begin());
+				}
+			}
+
+			// 可选：向背景色轻微松弛，模拟烟随时间的消散/混合（smokeFade=0 则纯平流）
+			if (smokeFade > 0.0f)
+			{
+				for (int i = 0; i < cells * 3; i++)
+				{
+					smoke[i] = ClampFloat(
+						smoke[i] + smokeFade *
+							(kSmokeBackground[i % 3] - smoke[i]),
+						0.0f, 1.0f);
+				}
 			}
 		}
 
@@ -1497,22 +1796,25 @@ namespace
 
 			CopyMomentsFromDevice(solver, 0);
 			ClearInjectedForces();   // ③ 清本帧注入的力 + 同步（§5.3，力"只活一帧"）
+			AdvectSmoke();           // ④ 烟雾被动平流：用本帧最新速度场（§3）
 			ComputeSolidLoads();
-			BuildFieldImage(flow, definition, fieldView, pixels);
+			BuildFieldImage(flow, definition, fieldView, pixels, smoke.data());
 			frame++;
 		}
 
 		void ToggleFieldView()
 		{
-			// 功能 4：三视图循环 Velocity → Vorticity → Colorful → Velocity（V 键）
+			// 功能 4/6：四视图循环 Velocity → Vorticity → Colorful → Smoke → Velocity（V 键）
 			fieldView = fieldView == DemoFieldView::VelocityMagnitude
 				? DemoFieldView::Vorticity
 				: (fieldView == DemoFieldView::Vorticity
 					? DemoFieldView::Colorful
-					: DemoFieldView::VelocityMagnitude);
+					: (fieldView == DemoFieldView::Colorful
+						? DemoFieldView::Smoke
+						: DemoFieldView::VelocityMagnitude));
 			if (initialized)
 			{
-				BuildFieldImage(flow, definition, fieldView, pixels);
+				BuildFieldImage(flow, definition, fieldView, pixels, smoke.data());
 			}
 		}
 
@@ -1577,6 +1879,47 @@ namespace
 				if (BodiesOverlap(
 					x, y, radius + 1.0f,
 					b.x, b.y, b.radius + 1.0f,
+					obstacleShape))
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		// 请求 4 修正：放大/缩小交互的合法性校验——半径调整后不得越界或与
+		// 其他物体重合（缩小永远合法，放大受此约束）。校验基于当前位置 x/y。
+		bool CanResizeBody(int index, float newRadius) const
+		{
+			if (index < 0 || index >= bodyCount)
+			{
+				return false;
+			}
+			const float minRadius = 2.0f;    // 与面板 Radius 滑块下限一致
+			const float maxRadius = 20.0f;   // 与面板 Radius 滑块上限一致
+			if (!(newRadius >= minRadius) || !(newRadius <= maxRadius))
+			{
+				return false;
+			}
+			// 越界校验：放大后物体（含 2 格安全间距）必须仍留在流场内
+			const float margin = newRadius + 2.0f;
+			if (bodies[index].x < margin ||
+				bodies[index].x > (float)definition.nx - margin - 1.0f ||
+				bodies[index].y < margin ||
+				bodies[index].y > (float)definition.ny - margin - 1.0f)
+			{
+				return false;
+			}
+			// 重叠校验：与其余物体按全局形状判定（+1 安全间距，同 CanPlaceBody）
+			for (int j = 0; j < bodyCount; j++)
+			{
+				if (j == index)
+				{
+					continue;
+				}
+				if (BodiesOverlap(
+					bodies[index].x, bodies[index].y, newRadius + 1.0f,
+					bodies[j].x, bodies[j].y, bodies[j].radius + 1.0f,
 					obstacleShape))
 				{
 					return false;
@@ -1681,8 +2024,17 @@ namespace
 	// §4.3 优先级约定：命令行显式 --case 时 ini 不覆盖 case（只覆盖其余参数）
 	bool gCaseSpecifiedOnCommandLine = false;
 
-	// §4.2 当前预设索引（Karman / Jet / Custom）
+	// §4.2 当前预设索引（Karman / Jet / Blank）
 	int gActivePreset = 0;
+
+	// 功能 5：FPS / 每步耗时统计（评估文档 §9 附加项 1）。
+	// FPS 用 0.5s 滚动窗口计数（Render 每帧 +1）；仿真耗时用
+	// QueryPerformanceCounter 在 AdvanceOneUiFrame 内测量并 EMA 平滑。
+	LARGE_INTEGER gPerfFrequency = {};
+	double gSimMsSmoothed = 0.0;   // 每 UI 帧仿真（AdvanceObstacles + Step）平均耗时 ms
+	DWORD gFpsWindowStart = 0;     // FPS 统计窗口起点（GetTickCount）
+	int gFpsFrameCount = 0;        // 窗口内渲染帧数
+	float gFps = 0.0f;             // 最近窗口 FPS
 
 	// 请求 1：UI / 窗口大小模式（小=当前默认窗口 1040×820，中=中等窗口，
 	// 大=全屏）。通过右侧面板的 UI size 栏切换。
@@ -2161,10 +2513,388 @@ namespace
 			client.bottom - client.top);
 	}
 
-	// 功能 5 预留挂点（§1.4）：本期为空实现
+	// 功能 5：格点类型枚举 → 可读字符串（调试覆盖显示用）
+	const char* FlagName(MLLATTICENODE_FLAG flag)
+	{
+		switch (flag)
+		{
+		case ML_INVALID: return "INVALID";
+		case ML_EMPTY: return "EMPTY";
+		case ML_FLUID: return "FLUID";
+		case ML_FLUID_REST: return "FLUID_REST";
+		case ML_WALL: return "WALL";
+		case ML_WALL_LEFT: return "WALL_LEFT";
+		case ML_WALL_RIGHT: return "WALL_RIGHT";
+		case ML_WALL_FOR: return "WALL_FOR";
+		case ML_WALL_BACK: return "WALL_BACK";
+		case ML_WALL_DOWN: return "WALL_DOWN";
+		case ML_WALL_UP: return "WALL_UP";
+		case ML_SOLID: return "SOLID";
+		case ML_INLET: return "INLET";
+		case ML_INLET0: return "INLET0";
+		case ML_INLET1: return "INLET1";
+		case ML_INLET2: return "INLET2";
+		case ML_OUTLET: return "OUTLET";
+		case ML_SMOKE: return "SMOKE";
+		case ML_WALL_CORNER: return "WALL_CORNER";
+		default: return "UNKNOWN";
+		}
+	}
+
+	// 功能 5：格点 (cx, cy) 的屏幕矩形（与 DrawBodies 的换算一致：
+	// 格点 x 向右、格点 y 向上，屏幕 y 向下 → cell.top < cell.bottom）。
+	// 注意：cx/cy 是格点下标（int），矩形覆盖 [cx, cx+1) × [cy, cy+1)。
+	RectF CellScreenRect(const RectF& field, int cx, int cy)
+	{
+		const int nx = gApp.definition.nx;
+		const int ny = gApp.definition.ny;
+		const float scaleX = field.Width() / (float)(nx - 1);
+		const float scaleY = field.Height() / (float)(ny - 1);
+		RectF rect;
+		rect.left = field.left + (float)cx * scaleX;
+		rect.right = field.left + (float)(cx + 1) * scaleX;
+		rect.bottom = field.bottom - (float)cy * scaleY;
+		rect.top = field.bottom - (float)(cy + 1) * scaleY;
+		return rect;
+	}
+
+	// 功能 5：Ctrl 模式下，以光标为中心把 field 纹理的 ±kMagnifierRadius
+	// 格区域放大绘制到流场左下角（评估文档 §6.2-5A 局部放大镜）。
+	// 只改 glTexCoord 子区域 + 固定大小 quad，不产生新数据。
+	void DrawMagnifier(const UiLayout& layout)
+	{
+		if (gApp.flow == NULL)
+		{
+			return;
+		}
+		// 鼠标在 UI 面板上时不画（面板下方格点坐标无意义，且避免遮挡控件）
+		if (IsOverUiPanel(gApp.mouseScreenX, gApp.mouseScreenY, layout) ||
+			UiWantsCaptureMouse())
+		{
+			return;
+		}
+
+		const RectF& field = layout.field;
+		const int nx = gApp.definition.nx;
+		const int ny = gApp.definition.ny;
+		const float invNx = 1.0f / (float)(nx - 1);
+		const float invNy = 1.0f / (float)(ny - 1);
+		const float centerX = ClampFloat(gApp.mouseFieldX, 0.0f, (float)(nx - 1));
+		const float centerY = ClampFloat(gApp.mouseFieldY, 0.0f, (float)(ny - 1));
+		const float half = (float)kMagnifierRadius;
+
+		// 纹理子区域（纹理 v=0 对应流场底部 / 格点 y=0，与 DrawField 同约定）
+		const float u0 = ClampFloat((centerX - half) * invNx, 0.0f, 1.0f);
+		const float u1 = ClampFloat((centerX + half) * invNx, 0.0f, 1.0f);
+		const float v0 = ClampFloat((centerY - half) * invNy, 0.0f, 1.0f);
+		const float v1 = ClampFloat((centerY + half) * invNy, 0.0f, 1.0f);
+		if (u1 - u0 < 1.0e-6f || v1 - v0 < 1.0e-6f)
+		{
+			return;
+		}
+
+		// 区域在原流场中的屏幕尺寸 → 等比放大到不超过 kMagnifierMaxSize
+		const float regionW = (u1 - u0) * field.Width();
+		const float regionH = (v1 - v0) * field.Height();
+		const float zoom = std::max(1.0f, std::min(
+			kMagnifierMaxSize / std::max(regionW, 1.0f),
+			kMagnifierMaxSize / std::max(regionH, 1.0f)));
+		const float mw = regionW * zoom;
+		const float mh = regionH * zoom;
+
+		// 位置：流场左下角（右下角已被色条占用，右上角是 FPS HUD）
+		const float x0 = field.left + 10.0f;
+		const float y0 = field.bottom - 10.0f - mh;
+
+		glEnable(GL_TEXTURE_2D);
+		glBindTexture(GL_TEXTURE_2D, gFieldTexture);
+		glColor3f(1.0f, 1.0f, 1.0f);
+		glBegin(GL_QUADS);
+		glTexCoord2f(u0, v0); glVertex2f(x0, y0 + mh);   // 左下
+		glTexCoord2f(u1, v0); glVertex2f(x0 + mw, y0 + mh); // 右下
+		glTexCoord2f(u1, v1); glVertex2f(x0 + mw, y0);   // 右上
+		glTexCoord2f(u0, v1); glVertex2f(x0, y0);        // 左上
+		glEnd();
+		glDisable(GL_TEXTURE_2D);
+
+		// 半透明混合：网格线与光标格点高亮
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+		// 网格线：区域内的整数格线（画在放大镜上便于观察格点结构）
+		glColor4f(0.55f, 0.60f, 0.65f, 0.45f);
+		glBegin(GL_LINES);
+		for (int gx = (int)std::ceil(centerX - half);
+			gx <= (int)std::floor(centerX + half); gx++)
+		{
+			if (gx <= 0 || gx >= nx) continue;
+			const float u = (float)gx * invNx;
+			if (u < u0 || u > u1) continue;
+			const float sx = x0 + (u - u0) / (u1 - u0) * mw;
+			glVertex2f(sx, y0);
+			glVertex2f(sx, y0 + mh);
+		}
+		for (int gy = (int)std::ceil(centerY - half);
+			gy <= (int)std::floor(centerY + half); gy++)
+		{
+			if (gy <= 0 || gy >= ny) continue;
+			const float v = (float)gy * invNy;
+			if (v < v0 || v > v1) continue;
+			const float sy = y0 + (v - v0) / (v1 - v0) * mh;
+			glVertex2f(x0, sy);
+			glVertex2f(x0 + mw, sy);
+		}
+		glEnd();
+
+		// 光标所在格点高亮框（黄绿）
+		const int gxc = std::max(0, std::min(nx - 2, (int)floorf(centerX)));
+		const int gyc = std::max(0, std::min(ny - 2, (int)floorf(centerY)));
+		const float uL = (float)gxc * invNx;
+		const float uR = (float)(gxc + 1) * invNx;
+		const float vB = (float)gyc * invNy;
+		const float vT = (float)(gyc + 1) * invNy;
+		const float hxL = x0 + (uL - u0) / (u1 - u0) * mw;
+		const float hxR = x0 + (uR - u0) / (u1 - u0) * mw;
+		const float hyB = y0 + (vB - v0) / (v1 - v0) * mh;
+		const float hyT = y0 + (vT - v0) / (v1 - v0) * mh;
+		glColor4f(0.98f, 0.85f, 0.25f, 0.9f);
+		glBegin(GL_LINE_LOOP);
+		glVertex2f(hxL, hyT);
+		glVertex2f(hxR, hyT);
+		glVertex2f(hxR, hyB);
+		glVertex2f(hxL, hyB);
+		glEnd();
+		glDisable(GL_BLEND);
+
+		// 外边框
+		glColor3f(0.85f, 0.88f, 0.92f);
+		glBegin(GL_LINE_LOOP);
+		glVertex2f(x0, y0);
+		glVertex2f(x0 + mw, y0);
+		glVertex2f(x0 + mw, y0 + mh);
+		glVertex2f(x0, y0 + mh);
+		glEnd();
+
+		// 放大倍数标签
+		char label[32];
+		sprintf_s(label, "x%.1f", zoom);
+		glColor3f(1.0f, 1.0f, 1.0f);
+		DrawText(x0, y0 - kTextLineHeight - 2.0f, label);
+	}
+
+	// 功能 5：Ctrl + 左键选中的格点 → 全部数据 + 宏观参数覆盖显示。
+	// 数据每帧在 Step() 的 CopyMomentsFromDevice 后即最新（含 force，见上）。
+	void DrawCellDebugOverlay(const UiLayout& layout)
+	{
+		const RectF& field = layout.field;
+		const int nx = gApp.definition.nx;
+		const int ny = gApp.definition.ny;
+		const int cx = gApp.debugCellX;
+		const int cy = gApp.debugCellY;
+		if (cx < 0 || cx >= nx || cy < 0 || cy >= ny || gApp.flow == NULL)
+		{
+			return;
+		}
+
+		const int idx = cy * nx + cx;
+		const mrFlow2D* flow = gApp.flow;
+
+		// 选中格点高亮框（黄绿）
+		const RectF cell = CellScreenRect(field, cx, cy);
+		glColor3f(0.98f, 0.85f, 0.25f);
+		glBegin(GL_LINE_LOOP);
+		glVertex2f(cell.left, cell.top);
+		glVertex2f(cell.right, cell.top);
+		glVertex2f(cell.right, cell.bottom);
+		glVertex2f(cell.left, cell.bottom);
+		glEnd();
+
+		// 组装调试文本：格点坐标 + 格点内全部数据 + 宏观参数（Re 等）
+		const Moments2D m = ReadMoments(flow, idx);
+		std::vector<std::string> lines;
+		char buffer[128];
+		sprintf_s(buffer, "cell: (%d, %d)", cx, cy);
+		lines.push_back(buffer);
+		sprintf_s(buffer, "flag: %s", FlagName(flow->flag[idx]));
+		lines.push_back(buffer);
+		sprintf_s(buffer, "rho: %.5f", (double)m.rho);
+		lines.push_back(buffer);
+		sprintf_s(buffer, "ux: %.5f", (double)m.ux);
+		lines.push_back(buffer);
+		sprintf_s(buffer, "uy: %.5f", (double)m.uy);
+		lines.push_back(buffer);
+		sprintf_s(buffer, "sxx: %.5f", (double)m.sxx);
+		lines.push_back(buffer);
+		sprintf_s(buffer, "syy: %.5f", (double)m.syy);
+		lines.push_back(buffer);
+		sprintf_s(buffer, "sxy: %.5f", (double)m.sxy);
+		lines.push_back(buffer);
+		sprintf_s(buffer, "fx: %.5f", (double)flow->forcex[idx]);
+		lines.push_back(buffer);
+		sprintf_s(buffer, "fy: %.5f", (double)flow->forcey[idx]);
+		lines.push_back(buffer);
+		// 烟雾场信息（请求 1）：RGB 三通道 + 灰度（亮度）——烟场为纯 host 数据，
+		// 未就绪（Init 前）时跳过，避免越界。
+		if ((int)gApp.smoke.size() >= idx * 3 + 3)
+		{
+			const REAL sr = gApp.smoke[idx * 3 + 0];
+			const REAL sg = gApp.smoke[idx * 3 + 1];
+			const REAL sb = gApp.smoke[idx * 3 + 2];
+			sprintf_s(buffer, "smoke: (%.3f, %.3f, %.3f)", (double)sr, (double)sg, (double)sb);
+			lines.push_back(buffer);
+			sprintf_s(buffer, "smoke lum: %.3f", (double)(0.299 * (double)sr + 0.587 * (double)sg + 0.114 * (double)sb));
+			lines.push_back(buffer);
+		}
+		sprintf_s(buffer, "Re: %.1f", (double)GetDemoCaseReynoldsNumber(gApp.definition));
+		lines.push_back(buffer);
+		sprintf_s(buffer, "iter: %d", gApp.iteration);
+		lines.push_back(buffer);
+		sprintf_s(buffer, "steps/frame: %d", gApp.stepsPerFrame);
+		lines.push_back(buffer);
+		sprintf_s(buffer, "vis: %.4f", (double)gApp.definition.viscosity);
+		lines.push_back(buffer);
+
+		// 面板尺寸与位置：优先放在格点右上方，放不下再换到左下方，最后 clamp 到场内
+		const float padX = 10.0f;
+		const float padY = 8.0f;
+		float maxLen = 0.0f;
+		for (const std::string& line : lines)
+		{
+			maxLen = std::max(maxLen, (float)line.size());
+		}
+		const float boxW = maxLen * kTextCharWidth + padX * 2.0f;
+		const float boxH = (float)lines.size() * kTextLineHeight + padY * 2.0f;
+		float px = cell.right + 10.0f;
+		if (px + boxW > field.right - 4.0f)
+		{
+			px = cell.left - 10.0f - boxW;
+		}
+		px = ClampFloat(px, field.left + 4.0f, field.right - 4.0f - boxW);
+		float py = cell.top - 10.0f;
+		if (py < field.top + 4.0f)
+		{
+			py = cell.top + 10.0f;
+		}
+		py = ClampFloat(py, field.top + 4.0f, field.bottom - 4.0f - boxH);
+
+		// 灰底（半透明黑）+ 白字
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		const RectF background = { px, py, px + boxW, py + boxH };
+		DrawSolidRect(background, 0.08f, 0.09f, 0.12f, 0.82f);
+		glDisable(GL_BLEND);
+
+		glColor3f(1.0f, 1.0f, 1.0f);
+		for (size_t i = 0; i < lines.size(); i++)
+		{
+			// 文字整体下移 6px（位图字体渲染位置偏高，请求 1）
+			DrawText(
+				px + padX,
+				py + padY + 6.0f + (float)i * kTextLineHeight,
+				lines[i]);
+		}
+	}
+
+	// 功能 5：FPS / 每步耗时 HUD——灰底白字，固定在画面（流场区域）右上角。
+	void DrawFpsOverlay(const RectF& field)
+	{
+		char line[4][64];
+		sprintf_s(line[0], "FPS: %.1f", (double)gFps);
+		const float frameMs = gFps > 0.5f ? 1000.0f / gFps : 0.0f;
+		sprintf_s(line[1], "frame: %.2f ms", (double)frameMs);
+		sprintf_s(line[2], "sim: %.2f ms", (double)gSimMsSmoothed);
+		const int steps = std::max(1, gApp.stepsPerFrame);
+		sprintf_s(line[3], "LBM: %.3f ms/step", (double)(gSimMsSmoothed / (float)steps));
+
+		const int lineCount = 4;
+		float maxLen = 0.0f;
+		for (int i = 0; i < lineCount; i++)
+		{
+			maxLen = std::max(maxLen, (float)strlen(line[i]));
+		}
+		const float padX = 10.0f;
+		const float padY = 6.0f;
+		const float boxW = maxLen * kTextCharWidth + padX * 2.0f;
+		const float boxH = (float)lineCount * kTextLineHeight + padY * 2.0f;
+		const float x0 = field.right - 10.0f - boxW;
+		const float y0 = field.top + 10.0f;
+
+		// 灰底（半透明）
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		const RectF background = { x0, y0, x0 + boxW, y0 + boxH };
+		DrawSolidRect(background, 0.20f, 0.22f, 0.25f, 0.85f);
+		glDisable(GL_BLEND);
+
+		// 白字（文字整体下移 6px，位图字体渲染位置偏高，请求 1）
+		glColor3f(1.0f, 1.0f, 1.0f);
+		for (int i = 0; i < lineCount; i++)
+		{
+			DrawText(x0 + padX, y0 + padY + 6.0f + (float)i * kTextLineHeight, line[i]);
+		}
+	}
+
+	// 请求 3：工具作用范围标识——鼠标位于流场且选中工具时，在鼠标位置画一个椭圆，
+	// 半轴 = 当前工具笔刷半径（brushRadius 格 → 屏幕像素，格点圆等比映射到屏幕），
+	// 直观显示该工具的实际作用范围。Ctrl 调试模式与鼠标落在 UI 面板上时不显示。
+	void DrawToolRangeMarker(const UiLayout& layout)
+	{
+		if (gApp.activeTool == LbmApp::InteractionTool::None ||
+			gApp.ctrlHeld)
+		{
+			return;
+		}
+		const RectF& field = layout.field;
+		if (gApp.mouseScreenX < field.left || gApp.mouseScreenX > field.right ||
+			gApp.mouseScreenY < field.top || gApp.mouseScreenY > field.bottom)
+		{
+			return;
+		}
+		const int nx = gApp.definition.nx;
+		const int ny = gApp.definition.ny;
+		const float scaleX = field.Width() / (float)(nx - 1);
+		const float scaleY = field.Height() / (float)(ny - 1);
+		// 笔刷中心 = 鼠标所在格点（mouseFieldX/Y），与 ApplyToolAt 的圆心一致
+		const float cx = field.left + gApp.mouseFieldX * scaleX;
+		const float cy = field.bottom - gApp.mouseFieldY * scaleY;
+		const float radiusX = gApp.brushRadius * scaleX;
+		const float radiusY = gApp.brushRadius * scaleY;
+
+		// 外圈：浅青色实线（对深色/浅色背景均有对比度）
+		glColor3f(0.35f, 0.90f, 1.0f);
+		glLineWidth(2.0f);
+		glBegin(GL_LINE_LOOP);
+		for (int i = 0; i < 64; i++)
+		{
+			const float angle = (float)i / 64.0f * 6.28318530718f;
+			glVertex2f(cx + radiusX * cosf(angle), cy + radiusY * sinf(angle));
+		}
+		glEnd();
+		glLineWidth(1.0f);
+
+		// 中心点：提示笔刷落点
+		glPointSize(3.0f);
+		glBegin(GL_POINTS);
+		glVertex2f(cx, cy);
+		glEnd();
+		glPointSize(1.0f);
+	}
+
+	// 功能 5 挂点：Ctrl 模式下的放大镜 + 格点调试信息覆盖显示。
+	// 松开 Ctrl（ctrlHeld == false）后两者全部消失（评估文档 §6.2-4）。
 	void DrawDebugOverlay(const UiLayout& layout)
 	{
-		// TODO(M6): Ctrl + 点击格点调试信息 / 放大镜
+		if (!gApp.ctrlHeld)
+		{
+			return;
+		}
+
+		DrawMagnifier(layout);
+
+		if (gApp.debugCellX >= 0 && gApp.debugCellY >= 0)
+		{
+			DrawCellDebugOverlay(layout);
+		}
 	}
 
 	// 请求 4：色条浮层——固定在画面（流场）右下角，随 fieldView 显示对应色标。
@@ -2173,6 +2903,11 @@ namespace
 	void DrawLegendOverlay(const RectF& field)
 	{
 		if (gLegendTexture == 0)
+		{
+			return;
+		}
+		// 烟雾视图（§5.2）：无色标语义，跳过色条
+		if (gApp.fieldView == DemoFieldView::Smoke)
 		{
 			return;
 		}
@@ -2277,9 +3012,9 @@ namespace
 				RestartWithCurrentSettings(window);
 			}
 
-			const char* viewItems[] = { "Velocity", "Vorticity", "Colorful" };
+			const char* viewItems[] = { "Velocity", "Vorticity", "Colorful", "Smoke" };
 			int viewIndex = (int)gApp.fieldView;
-			if (ImGui::Combo("Field view", &viewIndex, viewItems, 3))
+			if (ImGui::Combo("Field view", &viewIndex, viewItems, 4))
 			{
 				if (viewIndex != (int)gApp.fieldView)
 				{
@@ -2287,7 +3022,8 @@ namespace
 					if (gApp.initialized)
 					{
 						BuildFieldImage(
-							gApp.flow, gApp.definition, gApp.fieldView, gApp.pixels);
+							gApp.flow, gApp.definition, gApp.fieldView, gApp.pixels,
+							gApp.smoke.data());
 					}
 					RebuildLegendTexture();   // §5.5 色条内容随视图切换
 				}
@@ -2306,13 +3042,15 @@ namespace
 					caseIndex == 0
 					? DemoCaseId::KarmanVortex
 					: DemoCaseId::JetFlow);
-				gActivePreset = 2;   // 已偏离内置预设 → 标记 Custom
+				// 请求 3：无 Custom 标记——切 case 后即为该 case 的基础预设
+				gActivePreset = caseIndex;
 			}
 
-			// §4.2 预设下拉（选择即应用，等效 §5.3 的 [Apply]）
+			// §4.2 预设下拉（选择即应用，等效 §5.3 的 [Apply]）。
+			// 请求 3：移除 Custom，新增 Blank（空白版：无流速、无物体）。
 			const char* presetItems[] =
 			{
-				"Karman", "Jet", "Custom"
+				"Karman", "Jet", "Blank"
 			};
 			int presetIndex = gActivePreset;
 			if (ImGui::Combo("Preset", &presetIndex, presetItems, 3))
@@ -2369,20 +3107,9 @@ namespace
 					gLoadedParams = loaded;
 					ApplyLoadedStartupParams(window);
 					UpdateWindowTitle(window);
-					// 与默认 def 一致时归位对应基础预设，否则视为 Custom
-					gActivePreset = 2;
-					if (loaded.caseId == DemoCaseId::KarmanVortex &&
-						loaded.def.viscosity ==
-							GetDefaultDefinition(DemoCaseId::KarmanVortex).viscosity)
-					{
-						gActivePreset = 0;
-					}
-					else if (loaded.caseId == DemoCaseId::JetFlow &&
-						loaded.def.viscosity ==
-							GetDefaultDefinition(DemoCaseId::JetFlow).viscosity)
-					{
-						gActivePreset = 1;
-					}
+					// 请求 3：无 Custom 标记——按 case 归位基础预设（Karman=0 / Jet=1）
+					gActivePreset =
+						loaded.caseId == DemoCaseId::KarmanVortex ? 0 : 1;
 				}
 				else
 				{
@@ -2405,9 +3132,10 @@ namespace
 		if (ImGui::CollapsingHeader("PARAMETERS", ImGuiTreeNodeFlags_DefaultOpen))
 		{
 			// 粘度：写入 host 后同步设备（§4.1 第二类）
+			// 请求 2：下限降至 0.0005，使 0.001 粘度可稳定运行（ω≈1.994 < 2）
 			float viscosity = (float)gApp.definition.viscosity;
 			if (ImGui::SliderFloat(
-				"Viscosity", &viscosity, 0.001f, 0.05f, "%.4f"))
+				"Viscosity", &viscosity, 0.0005f, 0.05f, "%.4f"))
 			{
 				gApp.definition.viscosity = viscosity;
 				if (gApp.flow != NULL)
@@ -2472,22 +3200,6 @@ namespace
 					"Color saturation", &saturation, 0.0f, 1.0f, "%.2f"))
 				{
 					gApp.definition.colorfulSaturation = saturation;
-				}
-			}
-			// jetWidth：入口几何由 flag 固化，必须重建（§4.1 第三类）。
-			// 请求 4：仅 Jet flow 显示。滑块拖动过程中不触发任何动作，
-			// 松开（IsItemDeactivated）且值确实变化时才写入 definition，
-			// 并用 RestartWithCurrentSettings 按新 jetWidth 重启（保留其余设置）。
-			if (gApp.caseId == DemoCaseId::JetFlow)
-			{
-				int jetWidth = gApp.definition.jetWidth;
-				ImGui::SliderInt(
-					"Jet width", &jetWidth, 2, std::max(2, gApp.definition.nx / 2));
-				if (ImGui::IsItemDeactivated() &&
-					jetWidth != gApp.definition.jetWidth)
-				{
-					gApp.definition.jetWidth = jetWidth;
-					RestartWithCurrentSettings(window);
 				}
 			}
 		}
@@ -2595,9 +3307,21 @@ namespace
 					float radius = body.radius;
 					if (ImGui::SliderFloat("Radius", &radius, 2.0f, 20.0f, "%.1f"))
 					{
-						body.radius = ClampFloat(radius, 2.0f, 20.0f);
-						gApp.SyncBodiesToFlow();   // §2.2 半径变化 → 重分类
-						gApp.SyncBodyToDefinition();   // §4.1 数据同源（Re 显示）
+						// 请求 4 修正：放大/缩小交互带合法性校验——放大后不得越界或与
+						// 其他物体重合。非法候选沿滑轨向下取最大合法半径（缩小恒合法），
+						// 避免滑块拖动时回弹抖动；旧半径必合法（本校验保证）。
+						float candidate = ClampFloat(radius, 2.0f, 20.0f);
+						while (candidate > body.radius + 0.01f &&
+							!gApp.CanResizeBody(index, candidate))
+						{
+							candidate -= 0.5f;
+						}
+						if (candidate != body.radius)
+						{
+							body.radius = candidate;
+							gApp.SyncBodiesToFlow();   // §2.2 半径变化 → 重分类
+							gApp.SyncBodyToDefinition();   // §4.1 数据同源（Re 显示）
+						}
 					}
 					if (ImGui::Button("Remove selected"))
 					{
@@ -2611,7 +3335,7 @@ namespace
 			ImGui::EndDisabled();
 		}
 
-		// ---- TOOL（功能 4，通用工具栏：吹风 / 旋涡；点按确认式，仅两个选项直接展开）----
+		// ---- TOOL（功能 4/6，通用工具栏：吹风 / 旋涡 / 烟雾；点按确认式）----
 		if (ImGui::CollapsingHeader("Tool", ImGuiTreeNodeFlags_DefaultOpen))
 		{
 			// 点按确认式工具按钮：点击选中，再次点击已选中的工具 → 取消（回到 None）。
@@ -2639,15 +3363,76 @@ namespace
 					? LbmApp::InteractionTool::None
 					: LbmApp::InteractionTool::Vortex;
 			}
+			// ---- 烟雾工具（§4.3）：调色板 + 注入率 + 温度扩散；选中即自动切到 Smoke 视图 ----
+			ImGui::Selectable(
+				"Smoke",
+				gApp.activeTool == LbmApp::InteractionTool::PaintSmoke,
+				0,
+				ImVec2(toolWidth, 0.0f));
+			if (ImGui::IsItemClicked())
+			{
+				gApp.activeTool = (gApp.activeTool == LbmApp::InteractionTool::PaintSmoke)
+					? LbmApp::InteractionTool::None
+					: LbmApp::InteractionTool::PaintSmoke;
+				if (gApp.activeTool == LbmApp::InteractionTool::PaintSmoke
+					&& gApp.smokeToolAutoView
+					&& gApp.fieldView != DemoFieldView::Smoke)
+				{
+					gApp.fieldView = DemoFieldView::Smoke;
+					if (gApp.initialized)
+					{
+						BuildFieldImage(
+							gApp.flow, gApp.definition, gApp.fieldView, gApp.pixels,
+							gApp.smoke.data());
+					}
+					RebuildLegendTexture();
+				}
+			}
+			// ---- 擦除工具（请求 2）：消除笔刷范围内该处的全部烟雾 ----
+			ImGui::SameLine();
+			if (ImGui::Selectable(
+				"Eraser",
+				gApp.activeTool == LbmApp::InteractionTool::Eraser,
+				0,
+				ImVec2(toolWidth, 0.0f)))
+			{
+				gApp.activeTool = (gApp.activeTool == LbmApp::InteractionTool::Eraser)
+					? LbmApp::InteractionTool::None
+					: LbmApp::InteractionTool::Eraser;
+				if (gApp.activeTool == LbmApp::InteractionTool::Eraser
+					&& gApp.smokeToolAutoView
+					&& gApp.fieldView != DemoFieldView::Smoke)
+				{
+					gApp.fieldView = DemoFieldView::Smoke;
+					if (gApp.initialized)
+					{
+						BuildFieldImage(
+							gApp.flow, gApp.definition, gApp.fieldView, gApp.pixels,
+							gApp.smoke.data());
+					}
+					RebuildLegendTexture();
+				}
+			}
+			ImGui::ColorEdit3("Smoke color", gApp.smokeColor);
+			// 请求 2：笔刷强度——同时控制施加（Smoke）与削减（Eraser）烟雾的量；
+			// 1 = 立即将整个笔刷区域设为目标值（调色板色 / 背景灰），0 = 不施加影响
+			ImGui::SliderFloat("Brush strength", &gApp.brushStrength, 0.0f, 1.0f, "%.2f");
+			// 请求 1：自然扩散强度（0=不扩散；>0 时无气流也会向四周扩散，值越大越快）
+			ImGui::SliderFloat(
+				"Smoke temperature", &gApp.smokeTemperature, 0.0f, 1.0f, "%.2f");
+			// （可选）消散系数：ImGui::SliderFloat("Smoke fade", &gApp.smokeFade, 0.0f, 0.02f, "%.4f");
 			ImGui::SliderFloat("Brush radius", &gApp.brushRadius, 1.0f, 20.0f);
 			ImGui::SliderFloat("Blow strength", &gApp.blowStrength, 0.0f, 0.02f, "%.4f");
 		}
 
-		// ---- DEBUG（功能 5 预留，§5.3）----
-		if (ImGui::CollapsingHeader("DEBUG (reserved)"))
+		// ---- DEBUG（功能 5：Ctrl 放大 + 格点调试）----
+		if (ImGui::CollapsingHeader("DEBUG", ImGuiTreeNodeFlags_DefaultOpen))
 		{
-			ImGui::TextWrapped("Hold Ctrl + click a cell to inspect (M6).");
-			ImGui::Checkbox("Debug overlay", &gApp.debugMode);
+			// 请求 1：FPS / 每步耗时 HUD 显示开关（默认关闭，勾选后画面右上角显示）
+			ImGui::Checkbox("Show FPS overlay", &gApp.showFps);
+			ImGui::TextWrapped("Hold Ctrl: magnifier follows the cursor.");
+			ImGui::TextWrapped("Ctrl + click a cell: show all cell data.");
+			ImGui::TextWrapped("Release Ctrl: overlay disappears.");
 		}
 
 		// ---- CONTROLS ----
@@ -2689,6 +3474,20 @@ namespace
 		io.DeltaTime = std::max(0.001f, (float)(nowTick - lastFrameTick) / 1000.0f);
 		lastFrameTick = nowTick;
 
+		// 功能 5：FPS 统计（0.5s 滚动窗口）
+		gFpsFrameCount++;
+		if (gFpsWindowStart == 0)
+		{
+			gFpsWindowStart = nowTick;
+		}
+		if (nowTick - gFpsWindowStart >= 500)
+		{
+			gFps = (float)gFpsFrameCount * 1000.0f /
+				(float)(nowTick - gFpsWindowStart);
+			gFpsFrameCount = 0;
+			gFpsWindowStart = nowTick;
+		}
+
 		glViewport(0, 0, width, height);
 		glClearColor(0.035f, 0.043f, 0.051f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
@@ -2697,6 +3496,7 @@ namespace
 		const UiLayout layout = ComputeLayout(width, height);
 		DrawField(layout.field);
 		DrawBodies(layout.field);
+		DrawToolRangeMarker(layout);   // 请求 3：工具作用范围标识（鼠标位置椭圆）
 		DrawDebugOverlay(layout);
 		// 功能 4 第 3 点：colorful 色条随时间旋转，需每帧重建（256×1 纹理，开销可忽略）
 		if (gApp.fieldView == DemoFieldView::Colorful)
@@ -2704,6 +3504,11 @@ namespace
 			RebuildLegendTexture();
 		}
 		DrawLegendOverlay(layout.field);   // 请求 4：色条固定在画面右下角
+		// 请求 1：FPS / 每步耗时 HUD（画面右上角），默认关闭，由 Debug 栏开关控制
+		if (gApp.showFps)
+		{
+			DrawFpsOverlay(layout.field);
+		}
 
 		// §5.2 新渲染顺序：ImGui 帧在场景绘制之后
 		ImGui_ImplOpenGL2_NewFrame();
@@ -2727,8 +3532,19 @@ namespace
 
 	void AdvanceOneUiFrame()
 	{
+		// 功能 5：QPC 测量仿真耗时（AdvanceObstacles + Step），EMA 平滑后供 FPS HUD
+		LARGE_INTEGER start;
+		QueryPerformanceCounter(&start);
 		gApp.AdvanceObstacles();
 		gApp.Step();
+		LARGE_INTEGER end;
+		QueryPerformanceCounter(&end);
+		if (gPerfFrequency.QuadPart != 0)
+		{
+			const double milliseconds = (double)(end.QuadPart - start.QuadPart) *
+				1000.0 / (double)gPerfFrequency.QuadPart;
+			gSimMsSmoothed = gSimMsSmoothed * 0.90 + milliseconds * 0.10;
+		}
 	}
 
 	// §4.3 启动加载分发：把 gLoadedParams 的参数按 §4.1 三分类应用到当前算例。
@@ -2809,7 +3625,8 @@ namespace
 				gApp.obstacleShape);
 			gApp.solver.mlTransData2Gpu();   // 全量上传（含粘度）
 			BuildFieldImage(
-				gApp.flow, gApp.definition, gApp.fieldView, gApp.pixels);
+				gApp.flow, gApp.definition, gApp.fieldView, gApp.pixels,
+				gApp.smoke.data());
 			CreateFieldTexture();
 			UpdateWindowTitle(window);
 		}
@@ -2889,8 +3706,7 @@ namespace
 	}
 
 	// 请求 2/4：以当前全部设置重建算例（不改动已调参数）。
-	// 供 Restart 按钮与 jet width 应用共用；解决 jet width 调整后被
-	// ResetSimulation 以默认值覆盖（更改丢失）的 bug。
+	// 供 Restart 按钮使用；解决重建后被 ResetSimulation 以默认值覆盖（更改丢失）的 bug。
 	void RestartWithCurrentSettings(HWND window)
 	{
 		LoadedStartupParams saved;
@@ -2907,7 +3723,7 @@ namespace
 		UpdateWindowTitle(window);
 	}
 
-	// §4.2 预设系统：内置 Karman / Jet + 运行时 Custom（功能 4：smoke 预设已移除）。
+	// §4.2 预设系统：内置 Karman / Jet / Blank（空白版：无流速、无物体）。
 	// 切换预设 → def 拷贝 → 复用 ApplyLoadedStartupParams 分发。
 	void ApplyPreset(HWND window, int presetIndex)
 	{
@@ -2915,11 +3731,12 @@ namespace
 		{
 			const char* name;
 			DemoCaseId id;
+			bool blank;   // 空白版：零流速、无物体
 		} kPresets[] =
 		{
-			{ "Karman", DemoCaseId::KarmanVortex },
-			{ "Jet", DemoCaseId::JetFlow },
-			{ "Custom", DemoCaseId::KarmanVortex }   // 运行时 custom：当前状态
+			{ "Karman", DemoCaseId::KarmanVortex, false },
+			{ "Jet", DemoCaseId::JetFlow, false },
+			{ "Blank", DemoCaseId::KarmanVortex, true }   // 空白版：以 karman 几何为底
 		};
 		if (presetIndex < 0 || presetIndex >= (int)(sizeof(kPresets) / sizeof(kPresets[0])))
 		{
@@ -2927,12 +3744,19 @@ namespace
 		}
 
 		gActivePreset = presetIndex;
-		if (presetIndex == 2)
+
+		DemoCaseDefinition def = GetDefaultDefinition(kPresets[presetIndex].id);
+		if (kPresets[presetIndex].blank)
 		{
-			return;   // Custom：不做任何修改，仅标记
+			// 请求 3 空白版：没有流速（初始/入口速度与扰动全零）也没有物体
+			def.initialUx = 0.0f;
+			def.initialUy = 0.0f;
+			def.inletUx = 0.0f;
+			def.inletUy = 0.0f;
+			def.inletPerturbationAmplitude = 0.0f;
+			def.hasMovableObstacle = false;
 		}
 
-		const DemoCaseDefinition def = GetDefaultDefinition(kPresets[presetIndex].id);
 		gLoadedParams.valid = true;
 		gLoadedParams.caseId = kPresets[presetIndex].id;
 		gLoadedParams.def = def;
@@ -3006,6 +3830,20 @@ namespace
 			// §5.4 面板豁免：ImGui 捕获 + panel 矩形双保险
 			if (IsOverUiPanel(mouseX, mouseY, layout) || UiWantsCaptureMouse())
 			{
+				gApp.dragging = false;
+				return 0;
+			}
+
+			// 功能 5：Ctrl + 左键 = 选中格点（调试信息覆盖显示），
+			// 不进入物体拖动 / 力源工具（ApplyMouseEffects 亦有 ctrlHeld 门控）
+			if (gApp.ctrlHeld)
+			{
+				gApp.debugCellX = std::max(0, std::min(
+					gApp.definition.nx - 1,
+					(int)floorf(gApp.mouseFieldX + 0.5f)));
+				gApp.debugCellY = std::max(0, std::min(
+					gApp.definition.ny - 1,
+					(int)floorf(gApp.mouseFieldY + 0.5f)));
 				gApp.dragging = false;
 				return 0;
 			}
@@ -3149,12 +3987,19 @@ namespace
 			}
 			else if (wParam == 'R')
 			{
-				ResetSimulation(window, gApp.caseId);
+				// 请求 2：短按 R = Restart（按当前设置重建），长按 R = Reset（恢复默认）。
+				// 按下仅记录起始时刻，不做任何动作；松开（WM_KEYUP）按按住时长分发。
+				gApp.rPressStartTick = GetTickCount64();
 			}
 			else if (wParam == VK_TAB)
 			{
 				// §2.5 Tab 循环切换选中物体（按住不重复循环：被 wasDown 检查拦截）
 				gApp.CycleSelection();
+			}
+			else if (wParam == VK_CONTROL)
+			{
+				// 功能 5：按住 Ctrl = 调试/放大模式（WM_KEYUP 松开即退出）
+				gApp.ctrlHeld = true;
 			}
 			else if (wParam == VK_OEM_PLUS ||
 				wParam == VK_ADD)
@@ -3187,12 +4032,41 @@ namespace
 				{
 					gApp.SetMoveKey(wParam, false);
 				}
+				else if (wParam == VK_CONTROL)
+				{
+					// 功能 5：松开 Ctrl → 放大镜与调试信息消失
+					gApp.ctrlHeld = false;
+					gApp.debugCellX = gApp.debugCellY = -1;
+				}
+				else if (wParam == 'R')
+				{
+					// 请求 2：R 键短按 restart / 长按 reset（按住时长 ≥ kRLongPressMilliseconds）。
+					// 长按 → ResetSimulation（恢复默认）；短按 → RestartWithCurrentSettings（按当前设置重建）。
+					const ULONGLONG now = GetTickCount64();
+					const bool longPress =
+						gApp.rPressStartTick != 0 &&
+						now - gApp.rPressStartTick >=
+							(ULONGLONG)kRLongPressMilliseconds;
+					gApp.rPressStartTick = 0;
+					if (longPress)
+					{
+						ResetSimulation(window, gApp.caseId);
+					}
+					else
+					{
+						RestartWithCurrentSettings(window);
+					}
+					UpdateWindowTitle(window);
+					InvalidateRect(window, NULL, FALSE);
+				}
 			}
 			return 0;
 
 		case WM_KILLFOCUS:
 			gApp.ClearMoveKeys();
 			gApp.dragging = false;
+			gApp.ctrlHeld = false;   // 功能 5：失焦时退出调试模式
+			gApp.rPressStartTick = 0;   // 请求 2：失焦时丢弃 R 键计时，避免残留长按误触发
 			ReleaseCapture();   // §3.1：防止鼠标松在客户区外的残留拖动状态
 			return 0;
 
@@ -3301,6 +4175,8 @@ int main(int argc, char** argv)
 	}
 
 	SetProcessDPIAware();
+	// 功能 5：FPS / 每步耗时统计初始化（QPC 频率）
+	QueryPerformanceFrequency(&gPerfFrequency);
 	HINSTANCE instance = GetModuleHandleW(NULL);
 	const wchar_t* className = L"Home2DLbmOpenGLWindow";
 	WNDCLASSW windowClass = {};

@@ -94,12 +94,23 @@ namespace
 	}
 
 	void WriteBoundaryMoments(
-		mrFlow2D* flow,
-		int boundaryIndex,
-		int neighborIndex,
-		REAL targetUx,
-		REAL targetUy)
-	{
+	mrFlow2D* flow,
+	int boundaryIndex,
+	int neighborIndex,
+	REAL targetUx,
+	REAL targetUy)
+{
+		// 速度上限锁：出口外推等边界目标速度可能超调，先钳制幅值再写入，
+		// 避免边界速度放大进流场（与 GPU 端 umax2d_gpu 保持一致）。
+		const REAL targetSpeed = sqrtf(
+			targetUx * targetUx + targetUy * targetUy);
+		if (targetSpeed > umax2d_cpu)
+		{
+			const REAL scale = umax2d_cpu / targetSpeed;
+			targetUx *= scale;
+			targetUy *= scale;
+		}
+
 		REAL rho = flow->fMom[neighborIndex * 6 + 0];
 		const REAL neighborUx = flow->fMom[neighborIndex * 6 + 1];
 		const REAL neighborUy = flow->fMom[neighborIndex * 6 + 2];
@@ -184,6 +195,10 @@ const char* GetDemoFieldViewName(DemoFieldView view)
 	if (view == DemoFieldView::Colorful)
 	{
 		return "colorful flow";
+	}
+	if (view == DemoFieldView::Smoke)
+	{
+		return "smoke";
 	}
 	return "velocity magnitude";
 }

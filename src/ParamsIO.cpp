@@ -195,7 +195,7 @@ bool SaveAppParams(
 
 	out << "# Home2D LBM params (key=value per line, '#' = comment)\n";
 	out << "case=" << (def.cliName != nullptr ? def.cliName : "karman") << "\n";
-	out << "fieldView=" << (int)view << "\n";   // 0=Velocity 1=Vorticity 2=Colorful
+	out << "fieldView=" << (int)view << "\n";   // 0=Velocity 1=Vorticity 2=Colorful 3=Smoke
 	out << "stepsPerFrame=" << stepsPerFrame << "\n";
 	out << "obstacleShape=" << (int)shape << "\n";
 	out << "bodyCount=" << bodyCount << "\n";
@@ -305,6 +305,7 @@ bool LoadAppParams(
 				{
 				case 1: view = DemoFieldView::Vorticity; break;
 				case 2: view = DemoFieldView::Colorful; break;
+				case 3: view = DemoFieldView::Smoke; break;
 				default: view = DemoFieldView::VelocityMagnitude; break;
 				}
 			}
