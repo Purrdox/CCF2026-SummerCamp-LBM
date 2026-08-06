@@ -73,7 +73,7 @@ __global__ void mrSolver2DKernel(
 
 	// Collide the raw second moments with body-force correction.
 	const REAL vis = mlflow[0].vis_shear;
-	const REAL tau = 0.5f + vis / cs2;
+	const REAL tau = vis / cs2 + 0.5f;
 	const REAL omega = 1.0f / tau;
 	util.mlGetPIAfterCollision(
 		rho, ux, uy, Fx, Fy, omega, pixx_raw, piyy_raw, pixy_raw);
