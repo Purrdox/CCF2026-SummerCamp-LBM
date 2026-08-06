@@ -78,12 +78,11 @@ namespace
 	bool IsJetInlet(const DemoCaseDefinition& definition, int x)
 	{
 		// ===== ASSIGNMENT FILL BEGIN: P3-A jet-slot geometry =====
-		// The slot is centered at the bottom, covering exactly
-		// definition.jetWidth cells.
-		int center = definition.nx / 2;
-		int start = center - definition.jetWidth / 2;
-		int end = start + definition.jetWidth;
-		return x >= start && x < end;
+		// TODO: Return true exactly on the centered bottom inlet slot.
+		// The slot width is "definition.jetWidth" on a grid of "definition.nx".
+		const int start = (definition.nx - definition.jetWidth) / 2;
+		const int end = start + definition.jetWidth;
+		return (x >= start && x < end);
 		// ===== ASSIGNMENT FILL END: P3-A =====
 	}
 
@@ -187,36 +186,33 @@ MLLATTICENODE_FLAG GetDemoCaseBaseFlag(
 	int y)
 {
 	// ===== ASSIGNMENT FILL BEGIN: P2-P3-A case boundary flags =====
-	// Classify the fixed domain boundary for both Karman and Jet cases.
-
-	bool onLeft   = (x == 0);
-	bool onRight  = (x == definition.nx - 1);
-	bool onBottom = (y == 0);
-	bool onTop    = (y == definition.ny - 1);
-
+	// TODO: Classify the fixed domain boundary for both cases.
+	// Karman: full bottom inlet, top/left/right open outlets.
+	// Jet: centered bottom inlet, remaining bottom and both sides no-slip
+	// walls, and an open top outlet. Interior cells are fluid.
 	if (definition.id == DemoCaseId::KarmanVortex)
 	{
-		// Karman: bottom inlet, top / left / right open outlets.
-		if (onBottom)
-			return ML_INLET;
-		if (onTop || onLeft || onRight)
+		if (y == 0) return ML_INLET;
+		if (x == 0 || x == definition.nx - 1 || y == definition.ny - 1)
+		{
 			return ML_OUTLET;
+		}
 		return ML_FLUID;
 	}
-	else // JetFlow
+
+	if (definition.id == DemoCaseId::JetFlow)
 	{
-		// Jet: centered bottom inlet, remaining bottom + both sides walls,
-		// top open outlet.
-		if (onBottom)
+		if (y == 0)
+		{
 			return IsJetInlet(definition, x) ? ML_INLET : ML_WALL_DOWN;
-		if (onTop)
-			return ML_OUTLET;
-		if (onLeft)
-			return ML_WALL_LEFT;
-		if (onRight)
-			return ML_WALL_RIGHT;
+		}
+		if (x == 0) return ML_WALL_LEFT;
+		if (x == definition.nx - 1) return ML_WALL_RIGHT;
+		if (y == definition.ny - 1) return ML_OUTLET;
 		return ML_FLUID;
 	}
+
+	return ML_FLUID;
 	// ===== ASSIGNMENT FILL END: P2-P3-A =====
 }
 
@@ -228,16 +224,18 @@ bool IsDemoCaseObstacleCell(
 	float obstacleY)
 {
 	// ===== ASSIGNMENT FILL BEGIN: P2-A Karman cylinder geometry =====
-	// Identify lattice cells covered by the movable circular obstacle.
-	// Cases without an obstacle must never report a solid cell.
+	// TODO: Identify lattice cells covered by the movable circular
+	// obstacle. Cases without an obstacle must never report a solid cell.
 	if (!definition.hasMovableObstacle)
+	{
 		return false;
+	}
 
-	REAL dx = (REAL)x - obstacleX;
-	REAL dy = (REAL)y - obstacleY;
-	REAL dist2 = dx * dx + dy * dy;
-	REAL r = definition.obstacleRadius;
-	return dist2 <= r * r;
+	const float dx = (float)x - obstacleX;
+	const float dy = (float)y - obstacleY;
+	const float dist2 = dx * dx + dy * dy;
+	const float r2 = definition.obstacleRadius * definition.obstacleRadius;
+	return dist2 <= r2;
 	// ===== ASSIGNMENT FILL END: P2-A =====
 }
 
@@ -298,44 +296,36 @@ void InitializeDemoCase(
 	float obstacleY)
 {
 	// ===== ASSIGNMENT FILL BEGIN: P2-P3-B case initialization =====
-	// Initialize every lattice cell for the selected case.
-	int nx = definition.nx;
-	int ny = definition.ny;
-
-	for (int y = 0; y < ny; y++)
+	// TODO: Initialize every lattice cell for the selected case.
+	// Combine the fixed boundary flag with the optional Karman cylinder,
+	// choose initial/inlet/no-slip velocity, and initialize both moment
+	// buffers with equilibrium moments at rho = 1.
+	for (int y = 0; y < definition.ny; y++)
 	{
-		for (int x = 0; x < nx; x++)
+		for (int x = 0; x < definition.nx; x++)
 		{
-			int index = y * nx + x;
-
-			// Combine fixed boundary flag with optional Karman cylinder.
+			const int idx = y * definition.nx + x;
 			MLLATTICENODE_FLAG flag = GetDemoCaseBaseFlag(definition, x, y);
 			if (definition.hasMovableObstacle &&
 				IsDemoCaseObstacleCell(definition, x, y, obstacleX, obstacleY))
 			{
 				flag = ML_SOLID;
 			}
-			flow->flag[index] = flag;
+			flow->flag[idx] = flag;
 
-			// Choose initial/inlet/no-slip velocity.
-			REAL ux = definition.initialUx;
-			REAL uy = definition.initialUy;
-
+			REAL ux = 0.0f, uy = 0.0f;
 			if (flag == ML_INLET)
 			{
 				ux = definition.inletUx;
 				uy = definition.inletUy;
 			}
-			else if (flag == ML_WALL || flag == ML_WALL_LEFT ||
-				flag == ML_WALL_RIGHT || flag == ML_WALL_DOWN ||
-				flag == ML_WALL_UP || flag == ML_SOLID)
+			else if (flag == ML_FLUID)
 			{
-				ux = 0.0f;
-				uy = 0.0f;
+				ux = definition.initialUx;
+				uy = definition.initialUy;
 			}
 
-			// Initialize both moment buffers with equilibrium at rho = 1.
-			WriteEquilibriumMoments2D(flow, index, 1.0f, ux, uy);
+			WriteEquilibriumMoments2D(flow, idx, 1.0f, ux, uy);
 		}
 	}
 	// ===== ASSIGNMENT FILL END: P2-P3-B =====
@@ -347,66 +337,67 @@ void RefreshDemoCaseBoundaries(
 	int iteration)
 {
 	// ===== ASSIGNMENT FILL BEGIN: P2-P3-C time-dependent boundaries =====
-	// Refresh all outer-boundary moments before each UI frame.
-	int nx = definition.nx;
-	int ny = definition.ny;
-	int perturbationSign = sinf(2.0f * kPi * (REAL)iteration /
-		(REAL)definition.inletPerturbationPeriod);
+	// TODO: Refresh all outer-boundary moments before each UI frame.
+	// Add the configured transverse perturbation to the Karman inlet, find
+	// each boundary cell's adjacent interior cell, prescribe inlet velocity,
+	// copy interior velocity at open outlets, and use zero velocity at walls.
+	// Call WriteBoundaryMoments so non-equilibrium stress is extrapolated.
+	const REAL perturbation = (definition.id == DemoCaseId::KarmanVortex)
+		? definition.inletPerturbationAmplitude *
+			sinf(2.0f * kPi * (REAL)iteration / (REAL)definition.inletPerturbationPeriod)
+		: 0.0f;
 
-	for (int x = 0; x < nx; x++)
+	// Bottom boundary (y = 0): inlet or bottom wall, including the corners.
+	for (int x = 0; x < definition.nx; x++)
 	{
-		for (int y = 0; y < ny; y++)
+		const int idx = 0 * definition.nx + x;
+		const int neighborIdx = 1 * definition.nx + x;
+		REAL ux = 0.0f, uy = 0.0f;
+		if (flow->flag[idx] == ML_INLET)
 		{
-			// Only process boundary cells.
-			if (!(x == 0 || x == nx - 1 || y == 0 || y == ny - 1))
-				continue;
-
-			int index = y * nx + x;
-			MLLATTICENODE_FLAG flag = flow->flag[index];
-			if (flag == ML_SOLID)
-				continue;
-
-			// Determine neighbor index (one cell inward from the boundary).
-			int nxCell = x;
-			int nyCell = y;
-			if (y == 0)
-				nyCell = 1;
-			else if (y == ny - 1)
-				nyCell = ny - 2;
-			if (x == 0)
-				nxCell = 1;
-			else if (x == nx - 1)
-				nxCell = nx - 2;
-			int neighborIndex = nyCell * nx + nxCell;
-
-			if (flag == ML_INLET)
-			{
-				// Inlet velocity.
-				REAL ux = definition.inletUx;
-				REAL uy = definition.inletUy;
-
-				// Karman inlet perturbation in the transverse direction.
-				if (definition.id == DemoCaseId::KarmanVortex)
-				{
-					ux += definition.inletPerturbationAmplitude *
-						(REAL)perturbationSign;
-				}
-
-				WriteBoundaryMoments(flow, index, neighborIndex, ux, uy);
-			}
-			else if (flag == ML_OUTLET)
-			{
-				// Open outlet: copy interior velocity.
-				REAL ux = flow->fMom[neighborIndex * 6 + 1];
-				REAL uy = flow->fMom[neighborIndex * 6 + 2];
-				WriteBoundaryMoments(flow, index, neighborIndex, ux, uy);
-			}
-			else
-			{
-				// Wall: zero velocity, extrapolate non-equilibrium stress.
-				WriteBoundaryMoments(flow, index, neighborIndex, 0.0f, 0.0f);
-			}
+			ux = definition.inletUx + perturbation;
+			uy = definition.inletUy;
 		}
+		WriteBoundaryMoments(flow, idx, neighborIdx, ux, uy);
+	}
+
+	// Top boundary (y = ny - 1): open outlet, copy interior velocity.
+	for (int x = 0; x < definition.nx; x++)
+	{
+		const int idx = (definition.ny - 1) * definition.nx + x;
+		const int neighborIdx = (definition.ny - 2) * definition.nx + x;
+		WriteBoundaryMoments(flow, idx, neighborIdx,
+			flow->fMom[neighborIdx * 6 + 1],
+			flow->fMom[neighborIdx * 6 + 2]);
+	}
+
+	// Left boundary (x = 0): wall for jet, outlet for Karman. Corners are
+	// already covered by the bottom/top loops above.
+	for (int y = 1; y < definition.ny - 1; y++)
+	{
+		const int idx = y * definition.nx + 0;
+		const int neighborIdx = y * definition.nx + 1;
+		REAL ux = 0.0f, uy = 0.0f;
+		if (flow->flag[idx] == ML_OUTLET)
+		{
+			ux = flow->fMom[neighborIdx * 6 + 1];
+			uy = flow->fMom[neighborIdx * 6 + 2];
+		}
+		WriteBoundaryMoments(flow, idx, neighborIdx, ux, uy);
+	}
+
+	// Right boundary (x = nx - 1): wall for jet, outlet for Karman.
+	for (int y = 1; y < definition.ny - 1; y++)
+	{
+		const int idx = y * definition.nx + (definition.nx - 1);
+		const int neighborIdx = y * definition.nx + (definition.nx - 2);
+		REAL ux = 0.0f, uy = 0.0f;
+		if (flow->flag[idx] == ML_OUTLET)
+		{
+			ux = flow->fMom[neighborIdx * 6 + 1];
+			uy = flow->fMom[neighborIdx * 6 + 2];
+		}
+		WriteBoundaryMoments(flow, idx, neighborIdx, ux, uy);
 	}
 	// ===== ASSIGNMENT FILL END: P2-P3-C =====
 }
