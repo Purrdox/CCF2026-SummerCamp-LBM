@@ -42,13 +42,13 @@ namespace
 			"jetflow",
 			"Planar jet",
 			"Bottom slot jet into a quiescent channel",
-			96,
-			192,
-			0.020f,
+			96,//mark 96
+			192,//mark 192
+			0.00002f,//mark 粘度 0.020
 			0.0f,
 			0.0f,
 			0.0f,
-			0.08f,
+			0.08f,//mark 速度 0.08
 			0.0f,
 			0,
 			15,
@@ -361,14 +361,20 @@ void RefreshDemoCaseBoundaries(
 		WriteBoundaryMoments(flow, idx, neighborIdx, ux, uy);
 	}
 
-	// Top boundary (y = ny - 1): open outlet, copy interior velocity.
+	// Top boundary (y = ny - 1): open outlet. Use a convective (Orlanski)
+	// outlet that extrapolates the velocity toward the boundary from the two
+	// interior rows, letting vorticity leave the domain without reflecting
+	// perturbations back (important at high Reynolds numbers).
 	for (int x = 0; x < definition.nx; x++)
 	{
 		const int idx = (definition.ny - 1) * definition.nx + x;
 		const int neighborIdx = (definition.ny - 2) * definition.nx + x;
-		WriteBoundaryMoments(flow, idx, neighborIdx,
-			flow->fMom[neighborIdx * 6 + 1],
-			flow->fMom[neighborIdx * 6 + 2]);
+		const int secondIdx = (definition.ny - 3) * definition.nx + x;
+		const REAL ux = flow->fMom[neighborIdx * 6 + 1] -
+			0.9f * (flow->fMom[neighborIdx * 6 + 1] - flow->fMom[secondIdx * 6 + 1]);
+		const REAL uy = flow->fMom[neighborIdx * 6 + 2] -
+			0.9f * (flow->fMom[neighborIdx * 6 + 2] - flow->fMom[secondIdx * 6 + 2]);
+		WriteBoundaryMoments(flow, idx, neighborIdx, ux, uy);
 	}
 
 	// Left boundary (x = 0): wall for jet, outlet for Karman. Corners are
