@@ -750,125 +750,145 @@ namespace
 			bool flagsChanged = false;
 
 			// ===== ASSIGNMENT FILL BEGIN: P2-B moving-cylinder coupling =====
-		// 1. Reclassify cells and record newly uncovered fluid cells.
-		for (int y = 0; y < ny; y++)
-		{
-			for (int x = 0; x < nx; x++)
+			// TODO: Update the lattice representation of the prescribed
+			// moving Karman cylinder.
+			// 1. Reclassify cells and record newly uncovered fluid cells.
+			// 2. Reconstruct uncovered moments from unchanged fluid neighbors.
+			// 3. Set solid ghost-cell velocity to the wall velocity while
+			//    preserving adjacent non-equilibrium stress.
+			// 4. Record all touched cells and update the current obstacle pose.
+			// GPU synchronization is performed by the supplied call below.
 			{
-				int index = y * nx + x;
-				MLLATTICENODE_FLAG base = GetDemoCaseBaseFlag(
-					*definition, x, y);
-				newFlags[index] = IsDemoCaseObstacleCell(
-					*definition, x, y, newX, newY)
-					? ML_SOLID : base;
-
-				if (newFlags[index] != oldFlags[index])
+				// 1. Reclassify every cell and record the flag changes.
+				for (int y = 0; y < ny; y++)
 				{
-					flagsChanged = true;
-					touchedCells.push_back(index);
-
-					if (oldFlags[index] == ML_SOLID &&
-						newFlags[index] != ML_SOLID)
+					for (int x = 0; x < nx; x++)
 					{
-						releasedCells.push_back(index);
-					}
-					else if (oldFlags[index] != ML_SOLID &&
-						newFlags[index] == ML_SOLID)
-					{
-						solidCells.push_back(index);
+						const int idx = y * nx + x;
+						const MLLATTICENODE_FLAG baseFlag =
+							GetDemoCaseBaseFlag(*definition, x, y);
+						const bool isSolid = IsDemoCaseObstacleCell(
+							*definition, x, y, newX, newY);
+						newFlags[idx] = isSolid ? ML_SOLID : baseFlag;
 					}
 				}
-			}
-		}
 
-		// Apply new flags to the flow.
-		for (int i = 0; i < count; i++)
-			flow->flag[i] = newFlags[i];
-
-		// 2. Reconstruct released cell moments from unchanged fluid neighbors.
-		for (int i = 0; i < (int)releasedCells.size(); i++)
-		{
-			int index = releasedCells[i];
-			int cx = index % nx;
-			int cy = index / nx;
-			Moments2D avg;
-			if (AverageNeighborMoments(
-				flow, cx, cy, oldFlags, newFlags, true, avg))
-			{
-				WriteMoments2D(flow, index,
-					avg.rho, avg.ux, avg.uy,
-					avg.sxx, avg.syy, avg.sxy);
-			}
-			else
-			{
-				// Fallback: equilibrium with zero velocity.
-				WriteEquilibriumMoments2D(
-					flow, index, 1.0f, 0.0f, 0.0f);
-			}
-		}
-
-		// 3. Set solid ghost-cell velocity to the wall velocity while
-		//    preserving adjacent non-equilibrium stress.
-		for (int i = 0; i < (int)solidCells.size(); i++)
-		{
-			int index = solidCells[i];
-			int cx = index % nx;
-			int cy = index / nx;
-
-			// Find a valid fluid neighbor for stress extrapolation.
-			bool found = false;
-			Moments2D neighborMoments;
-			for (int dy = -1; dy <= 1 && !found; dy++)
-			{
-				for (int dx = -1; dx <= 1 && !found; dx++)
+				for (int idx = 0; idx < count; idx++)
 				{
-					if (dx == 0 && dy == 0)
-						continue;
-					int nx2 = cx + dx;
-					int ny2 = cy + dy;
-					if (nx2 < 0 || nx2 >= nx ||
-						ny2 < 0 || ny2 >= ny)
-						continue;
-					int nIndex = ny2 * nx + nx2;
-					if (newFlags[nIndex] != ML_FLUID)
-						continue;
-					neighborMoments = ReadMoments(flow, nIndex);
-					if (AreMomentsUsable(neighborMoments))
+					const bool wasSolid = (oldFlags[idx] == ML_SOLID);
+					const bool isSolid = (newFlags[idx] == ML_SOLID);
+					if (wasSolid && !isSolid)
 					{
-						found = true;
+						releasedCells.push_back(idx);
+					}
+					else if (!wasSolid && isSolid)
+					{
+						solidCells.push_back(idx);
 					}
 				}
+
+				// 2. Reconstruct uncovered moments from unchanged fluid
+				//    neighbors so the released region has valid initial data.
+				for (const int idx : releasedCells)
+				{
+					const int x = idx % nx;
+					const int y = idx / nx;
+					Moments2D result;
+					if (AverageNeighborMoments(
+						flow, x, y, oldFlags, newFlags, true, result))
+					{
+						WriteMoments2D(flow, idx, result.rho, result.ux,
+							result.uy, result.sxx, result.syy, result.sxy);
+					}
+				}
+
+				// Boundary-moment helper mirroring WriteBoundaryMoments:
+				// keep the adjacent fluid stress, replace velocity by the wall.
+				auto writeBoundaryMoments =
+					[&](int boundaryIndex, int neighborIndex,
+						REAL targetUx, REAL targetUy)
+				{
+					REAL rho = flow->fMom[neighborIndex * 6 + 0];
+					const REAL neighborUx = flow->fMom[neighborIndex * 6 + 1];
+					const REAL neighborUy = flow->fMom[neighborIndex * 6 + 2];
+					const REAL neighborSxx = flow->fMom[neighborIndex * 6 + 3];
+					const REAL neighborSyy = flow->fMom[neighborIndex * 6 + 4];
+					const REAL neighborSxy = flow->fMom[neighborIndex * 6 + 5];
+
+					if (!IsFinite(rho) || rho < 0.5f || rho > 1.5f)
+					{
+						rho = 1.0f;
+					}
+
+					if (!IsFinite(neighborUx) || !IsFinite(neighborUy) ||
+						!IsFinite(neighborSxx) || !IsFinite(neighborSyy) ||
+						!IsFinite(neighborSxy))
+					{
+						WriteEquilibriumMoments2D(
+							flow, boundaryIndex, rho, targetUx, targetUy);
+						return;
+					}
+
+					const REAL sxx = targetUx * targetUx +
+						(neighborSxx - neighborUx * neighborUx);
+					const REAL syy = targetUy * targetUy +
+						(neighborSyy - neighborUy * neighborUy);
+					const REAL sxy = targetUx * targetUy +
+						(neighborSxy - neighborUx * neighborUy);
+					WriteMoments2D(flow, boundaryIndex, rho, targetUx,
+						targetUy, sxx, syy, sxy);
+				};
+
+				// 3. Set each new solid ghost cell to the wall velocity while
+				//    preserving the non-equilibrium stress of a fluid neighbor.
+				for (const int solidIdx : solidCells)
+				{
+					const int sx = solidIdx % nx;
+					const int sy = solidIdx / nx;
+					bool found = false;
+					for (int dy = -1; dy <= 1 && !found; dy++)
+					{
+						for (int dx = -1; dx <= 1; dx++)
+						{
+							if (dx == 0 && dy == 0) continue;
+							const int neighborX = sx + dx;
+							const int neighborY = sy + dy;
+							if (neighborX < 0 || neighborX >= nx ||
+								neighborY < 0 || neighborY >= ny) continue;
+							const int neighbor = neighborY * nx + neighborX;
+							if (newFlags[neighbor] != ML_FLUID) continue;
+							writeBoundaryMoments(
+								solidIdx, neighbor, wallUx, wallUy);
+							found = true;
+							break;
+						}
+					}
+					if (!found)
+					{
+						WriteEquilibriumMoments2D(
+							flow, solidIdx, 1.0f, wallUx, wallUy);
+					}
+				}
+
+				// 4. Record every touched cell and update the obstacle pose.
+				touchedCells.insert(touchedCells.end(),
+					solidCells.begin(), solidCells.end());
+				touchedCells.insert(touchedCells.end(),
+					releasedCells.begin(), releasedCells.end());
+
+				obstacleX = newX;
+				obstacleY = newY;
+				obstacleVelocityX = wallUx;
+				obstacleVelocityY = wallUy;
+
+				for (int idx = 0; idx < count; idx++)
+				{
+					flow->flag[idx] = newFlags[idx];
+				}
+				flagsChanged = true;
 			}
 
-			if (found)
-			{
-				// Non-equilibrium extrapolation with wall velocity.
-				REAL rho = neighborMoments.rho;
-				REAL sxx = wallUx * wallUx +
-					(neighborMoments.sxx -
-						neighborMoments.ux * neighborMoments.ux);
-				REAL syy = wallUy * wallUy +
-					(neighborMoments.syy -
-						neighborMoments.uy * neighborMoments.uy);
-				REAL sxy = wallUx * wallUy +
-					(neighborMoments.sxy -
-						neighborMoments.ux * neighborMoments.uy);
-				WriteMoments2D(flow, index,
-					rho, wallUx, wallUy, sxx, syy, sxy);
-			}
-			else
-			{
-				WriteEquilibriumMoments2D(
-					flow, index, 1.0f, wallUx, wallUy);
-			}
-		}
-
-		// 4. Update the current obstacle pose.
-		obstacleX = newX;
-		obstacleY = newY;
-		obstacleVelocityX = wallUx;
-		obstacleVelocityY = wallUy;
-		// ===== ASSIGNMENT FILL END: P2-B =====
+			// ===== ASSIGNMENT FILL END: P2-B =====
 			SyncCellsToDevice(solver, 0, touchedCells, flagsChanged);
 		}
 
